@@ -331,16 +331,6 @@ export default function App() {
           >
             Entrar
           </button>
-
-          <div style={{ marginTop: 22, paddingTop: 16, borderTop: `1px solid ${C.borde}`, display: "flex", gap: 8 }}>
-            {Object.entries(USERS).map(([k, u]) => (
-              <button key={k} onClick={() => { setPin(u.pin); }}
-                style={{ flex: 1, padding: "8px", borderRadius: 10, cursor: "pointer", background: "transparent", border: `1px solid ${C.borde}`, color: C.sec, fontSize: 11 }}>
-                <span style={{ color: u.color, fontWeight: 700 }}>{u.name}</span>
-                <br />(demo)
-              </button>
-            ))}
-          </div>
         </div>
       </div>
     );
@@ -478,13 +468,9 @@ export default function App() {
           </div>
         </div>
 
-        <div style={{ background: `${C.azul}12`, border: `1px dashed ${C.azul}66`, borderRadius: 14, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: C.sec }}>
+        <div style={{ background: `${C.azul}12`, border: `1px dashed ${C.azul}66`, borderRadius: 14, padding: "10px 14px", display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: C.sec }}>
           <Users size={16} color={C.azul} />
-          <span style={{ flex: 1 }}>Conectado a Firebase (tiempo real)</span>
-          <button onClick={() => setCurrentUser(other)} className="rp-display"
-            style={{ padding: "6px 12px", borderRadius: 10, background: USERS[other].color, border: "none", color: "#fff", fontWeight: 600, fontSize: 12, cursor: "pointer" }}>
-            Ver como {USERS[other].name}
-          </button>
+          <span>Conectado a Firebase · sincronizado en tiempo real</span>
         </div>
       </div>
 

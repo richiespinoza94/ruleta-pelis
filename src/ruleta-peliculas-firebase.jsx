@@ -47,9 +47,22 @@ const ESTADOS = [
   { label: "Perezoso/a", emoji: "🦥" },
   { label: "Feliz", emoji: "😄" },
   { label: "Nostálgico/a", emoji: "🌙" },
+  { label: "Enamorado/a", emoji: "❤️" },
+  { label: "Extrañándote", emoji: "🥺" },
+  { label: "Con ganas de abrazos", emoji: "🤗" },
+  { label: "Con antojo de una cita", emoji: "💕" },
+  { label: "Pensativo/a", emoji: "🤔" },
+  { label: "Necesito mi espacio", emoji: "🌿" },
 ];
 
-const LUGARES = ["Casa", "Cine", "Casa de un amigo", "En el celular", "Cama", "Otro"];
+/* Estado dinámico "Pensando en [pareja]" — se arma con el nombre real de la otra persona,
+   por eso no vive en la lista fija de arriba (Ricardo no puede "pensar en Ricardo"). */
+const estadoPensandoEnPareja = (nombrePareja) => ({
+  label: `Pensando en ${nombrePareja}`,
+  emoji: "🥰",
+});
+
+const LUGARES = ["Cine", "Centro Jas Noroeste", "Casa de Cata", "Casa de Ricardo", "ILN", "IRU", "Otro"];
 
 const PELICULAS_INICIALES = [
   { id: "m1", title: "500 días con Summer", year: 2009, genre: "Romance", synopsis: "Tom, un romántico empedernido, recuerda de forma no lineal los 500 días de su relación con Summer, una chica que no cree en el amor verdadero. Una historia agridulce sobre las expectativas y la realidad del amor.", state: "ruleta" },
@@ -278,7 +291,10 @@ export default function App() {
         const inicial = {
           movies: PELICULAS_INICIALES,
           history: [],
-          estados: { ricardo: ESTADOS[10], catalina: ESTADOS[2] },
+          estados: {
+            ricardo: ESTADOS.find((e) => e.label === "Feliz"),
+            catalina: ESTADOS.find((e) => e.label === "Romántico/a"),
+          },
           spinReq: null,
         };
         await setDoc(SALA_DOC, inicial);
@@ -318,17 +334,42 @@ export default function App() {
     }
   }, [sala?.spinReq?.status]); // eslint-disable-line
 
-  /* ---- #2 Toast cuando el estado de ánimo del otro cambia ---- */
+  /* ---- #2 Toast + notificación cuando el estado de ánimo del otro cambia ----
+     Debounce real: si cambia de estado varias veces seguidas, cada cambio nuevo
+     cancela (vía cleanup de useEffect) el aviso pendiente del cambio anterior.
+     Solo cuando la persona "se queda quieta" en un estado por 2.5s se envía UNA notificación. */
+  const NOTIF_ESTADO_DEBOUNCE_MS = 2500;
   useEffect(() => {
-    if (!currentUser || !sala?.estados) return;
+    if (!currentUser || !sala?.estados) return undefined;
     const other = currentUser === "ricardo" ? "catalina" : "ricardo";
     const nuevo = sala.estados[other];
-    if (prevOtherEstado.current && nuevo && prevOtherEstado.current.label !== nuevo.label) {
-      setToast(`${USERS[other].name} ahora está ${nuevo.emoji} ${nuevo.label}`);
-      vibrate(15);
-      setTimeout(() => setToast(null), 3200);
-    }
+    const cambio = prevOtherEstado.current && nuevo && prevOtherEstado.current.label !== nuevo.label;
     prevOtherEstado.current = nuevo;
+    if (!cambio) return undefined;
+
+    // Toast en pantalla: se actualiza al instante con el estado más reciente
+    setToast(`${USERS[other].name} ahora está ${nuevo.emoji} ${nuevo.label}`);
+    vibrate(15);
+    const toastTimer = setTimeout(() => setToast(null), 3200);
+
+    // Notificación del navegador: espera a que se "asiente" el cambio antes de avisar
+    const notifTimer = setTimeout(() => {
+      if (typeof Notification !== "undefined" && Notification.permission === "granted" && document.hidden) {
+        try {
+          new Notification(`${nuevo.emoji} ${USERS[other].name} cambió su estado`, {
+            body: `Ahora está ${nuevo.label}`,
+            tag: "ruleta-estado", // mismo tag = si por algo llegaran 2, la 2da reemplaza a la 1ra en vez de duplicar
+          });
+        } catch (e) { /* silencioso */ }
+      }
+    }, NOTIF_ESTADO_DEBOUNCE_MS);
+
+    // Cleanup: si el efecto vuelve a correr antes de que pase el debounce
+    // (osea, la persona cambió de estado de nuevo), cancela el aviso anterior sin enviarlo.
+    return () => {
+      clearTimeout(toastTimer);
+      clearTimeout(notifTimer);
+    };
   }, [sala?.estados, currentUser]);
 
   /* ---- #4 Notificación del navegador cuando piden girar (si la pestaña está en 2do plano) ---- */
@@ -621,20 +662,39 @@ export default function App() {
 
       {showEstadoPicker && (
         <Modal onClose={() => setShowEstadoPicker(false)} title="¿Cómo te sientes?">
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-            {ESTADOS.map((e) => {
-              const sel = sala.estados[currentUser].label === e.label;
+          <div className="rp-scroll" style={{ maxHeight: "60vh", overflowY: "auto", paddingRight: 4 }}>
+            {/* Opción dinámica destacada: usa el nombre real de la pareja, no una lista fija */}
+            {(() => {
+              const opcionPareja = estadoPensandoEnPareja(USERS[other].name);
+              const sel = sala.estados[currentUser].label === opcionPareja.label;
               return (
-                <button key={e.label}
+                <button
                   onClick={() => {
-                    guardar({ estados: { ...sala.estados, [currentUser]: e } });
+                    guardar({ estados: { ...sala.estados, [currentUser]: opcionPareja } });
                     setShowEstadoPicker(false);
                   }}
-                  style={{ display: "flex", alignItems: "center", gap: 8, padding: "12px", borderRadius: 12, cursor: "pointer", background: sel ? `${me.color}22` : C.cardHi, border: `1.5px solid ${sel ? me.color : C.borde}`, color: C.texto, fontSize: 13, textAlign: "left" }}>
-                  <span style={{ fontSize: 20 }}>{e.emoji}</span> {e.label}
+                  style={{ width: "100%", display: "flex", alignItems: "center", gap: 10, padding: "14px", borderRadius: 14, cursor: "pointer", marginBottom: 12, background: sel ? `${me.color}22` : `linear-gradient(135deg, ${C.rojo}14, ${C.azul}14)`, border: `1.5px solid ${sel ? me.color : C.dorado}66`, color: C.texto, fontSize: 14, textAlign: "left" }}>
+                  <span style={{ fontSize: 22 }}>{opcionPareja.emoji}</span>
+                  <span className="rp-display" style={{ fontWeight: 700 }}>{opcionPareja.label}</span>
                 </button>
               );
-            })}
+            })()}
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              {ESTADOS.map((e) => {
+                const sel = sala.estados[currentUser].label === e.label;
+                return (
+                  <button key={e.label}
+                    onClick={() => {
+                      guardar({ estados: { ...sala.estados, [currentUser]: e } });
+                      setShowEstadoPicker(false);
+                    }}
+                    style={{ display: "flex", alignItems: "center", gap: 8, padding: "12px", borderRadius: 12, cursor: "pointer", background: sel ? `${me.color}22` : C.cardHi, border: `1.5px solid ${sel ? me.color : C.borde}`, color: C.texto, fontSize: 13, textAlign: "left" }}>
+                    <span style={{ fontSize: 20 }}>{e.emoji}</span> {e.label}
+                  </button>
+                );
+              })}
+            </div>
           </div>
         </Modal>
       )}
@@ -732,7 +792,7 @@ function Modal({ title, children, onClose }) {
 function ViewingForm({ movie, currentUser, onCancel, onSave }) {
   const draft = movie.draft || {};
   const [fecha, setFecha] = useState(draft.fecha || new Date().toISOString().slice(0, 10));
-  const [lugar, setLugar] = useState(draft.lugar || "Casa");
+  const [lugar, setLugar] = useState(draft.lugar || LUGARES[0]);
   const [comida, setComida] = useState(draft.comida || "");
   const [rating, setRating] = useState(draft.rating || 0);
   const [miNota, setMiNota] = useState(draft.notas?.[currentUser] || "");

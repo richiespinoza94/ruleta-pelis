@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   Lock, Film, Play, Check, X, MapPin, Popcorn, Sparkles, Clock,
   ChevronDown, RotateCw, Star, ArrowLeft, Users, Calendar, Eye, Heart
@@ -68,6 +68,13 @@ const PELICULAS_INICIALES = [
 
 const SLICE_COLORS = [C.verde, C.rojo, C.azul];
 
+/* Vibración háptica — no-op en navegadores/dispositivos sin soporte (ej. iOS Safari) */
+const vibrate = (pattern) => {
+  if (typeof navigator !== "undefined" && navigator.vibrate) {
+    try { navigator.vibrate(pattern); } catch (e) { /* silencioso */ }
+  }
+};
+
 const FontStyles = () => (
   <style>{`
     @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Poppins:wght@400;500;600&display=swap');
@@ -82,6 +89,25 @@ const FontStyles = () => (
     .rp-slideup { animation: rp-slideup 0.4s ease both; }
     .rp-scroll::-webkit-scrollbar { width: 6px; }
     .rp-scroll::-webkit-scrollbar-thumb { background: ${C.borde}; border-radius: 3px; }
+    @keyframes rp-confetti-fall {
+      0% { transform: translateY(0) rotate(0deg); opacity: 1; }
+      100% { transform: translateY(340px) rotate(340deg); opacity: 0; }
+    }
+    @keyframes rp-shake {
+      10%, 90% { transform: translateX(-1px); }
+      20%, 80% { transform: translateX(2px); }
+      30%, 50%, 70% { transform: translateX(-4px); }
+      40%, 60% { transform: translateX(4px); }
+    }
+    .rp-shake { animation: rp-shake 0.4s ease; }
+    .rp-confetti-piece { animation-name: rp-confetti-fall; animation-timing-function: ease-in; animation-fill-mode: forwards; border-radius: 2px; }
+    /* #8 Accesibilidad: respeta la preferencia de movimiento reducido del sistema
+       (solo afecta animaciones decorativas, no la rotación funcional de la ruleta,
+       para no dejar la pantalla "congelada" mientras el código sigue esperando el resultado) */
+    @media (prefers-reduced-motion: reduce) {
+      .rp-pop, .rp-pulse, .rp-slideup, .rp-confetti-piece, .rp-shake { animation: none !important; }
+      .rp-confetti-wrap { display: none !important; }
+    }
   `}</style>
 );
 
@@ -181,6 +207,37 @@ function Legend({ movies }) {
   );
 }
 
+/* #3 Confeti — ráfaga de partículas en los colores de la app, respeta prefers-reduced-motion */
+function Confetti() {
+  const pieces = useMemo(() => {
+    const arr = [];
+    for (let i = 0; i < 26; i++) {
+      arr.push({
+        id: i,
+        left: Math.random() * 100,
+        delay: Math.random() * 0.25,
+        duration: 1.1 + Math.random() * 0.7,
+        color: SLICE_COLORS[i % 3],
+        rotate: Math.random() * 360,
+        size: 6 + Math.random() * 6,
+      });
+    }
+    return arr;
+  }, []);
+  return (
+    <div aria-hidden="true" className="rp-confetti-wrap" style={{ position: "absolute", inset: 0, overflow: "hidden", pointerEvents: "none", borderRadius: 24 }}>
+      {pieces.map((p) => (
+        <span key={p.id} className="rp-confetti-piece" style={{
+          position: "absolute", top: -10, left: `${p.left}%`,
+          width: p.size, height: p.size * 0.4, background: p.color,
+          animationDelay: `${p.delay}s`, animationDuration: `${p.duration}s`,
+          transform: `rotate(${p.rotate}deg)`,
+        }} />
+      ))}
+    </div>
+  );
+}
+
 /* ============================================================
    APP PRINCIPAL
    👉 TODOS los hooks van aquí arriba, sin excepción,
@@ -203,8 +260,13 @@ export default function App() {
   const [registrando, setRegistrando] = useState(null);
   const [showHistory, setShowHistory] = useState(false);
   const [detalleHist, setDetalleHist] = useState(null);
+  const [saving, setSaving] = useState(false);          // #8 loading en escrituras
+  const [toast, setToast] = useState(null);              // #2 micro-toast de estado
 
   const spinRef = useRef(false);           // ✅ ahora arriba, siempre se ejecuta
+  const pinBoxRefs = useRef([]);            // #1 casillas de PIN
+  const prevOtherEstado = useRef(null);     // #2 detectar cambio de estado remoto
+  const notifiedReqRef = useRef(null);      // #4 evitar notificar 2 veces la misma solicitud
   const SALA_DOC = doc(db, "sala", "casa");
 
   /* ---- Escuchar cambios en tiempo real ---- */
@@ -243,18 +305,62 @@ export default function App() {
       if (delta < 0) delta += 360;
       const newRot = rotation + 360 * 6 + delta;
       setSpinning(true);
+      // #3 Vibración tipo "tick" mientras gira (patrón corto repetido) + vibración larga al aterrizar
+      vibrate([12, 90, 12, 90, 12, 90, 12, 90, 12]);
       setRotation(newRot);
       setTimeout(() => {
         setSpinning(false);
         setWinner(target);
+        vibrate([40, 30, 80]); // remate al aterrizar
         setDoc(SALA_DOC, { spinReq: null }, { merge: true });
         spinRef.current = false;
       }, 3600);
     }
   }, [sala?.spinReq?.status]); // eslint-disable-line
 
-  /* ---- Helper para guardar cambios ---- */
-  const guardar = (cambios) => setDoc(SALA_DOC, cambios, { merge: true });
+  /* ---- #2 Toast cuando el estado de ánimo del otro cambia ---- */
+  useEffect(() => {
+    if (!currentUser || !sala?.estados) return;
+    const other = currentUser === "ricardo" ? "catalina" : "ricardo";
+    const nuevo = sala.estados[other];
+    if (prevOtherEstado.current && nuevo && prevOtherEstado.current.label !== nuevo.label) {
+      setToast(`${USERS[other].name} ahora está ${nuevo.emoji} ${nuevo.label}`);
+      vibrate(15);
+      setTimeout(() => setToast(null), 3200);
+    }
+    prevOtherEstado.current = nuevo;
+  }, [sala?.estados, currentUser]);
+
+  /* ---- #4 Notificación del navegador cuando piden girar (si la pestaña está en 2do plano) ---- */
+  useEffect(() => {
+    if (!currentUser) return;
+    const req = sala?.spinReq;
+    const reqId = req ? `${req.by}-${req.seed}` : null;
+    if (
+      req && req.status === "pending" && req.by !== currentUser &&
+      reqId !== notifiedReqRef.current
+    ) {
+      notifiedReqRef.current = reqId;
+      vibrate([25, 60, 25]);
+      if (typeof Notification !== "undefined") {
+        if (Notification.permission === "granted" && document.hidden) {
+          try { new Notification("🎡 ¡Quieren girar la ruleta!", { body: `${USERS[req.by].name} está esperando tu aprobación`, tag: "ruleta-spin" }); } catch (e) {}
+        } else if (Notification.permission === "default") {
+          Notification.requestPermission();
+        }
+      }
+    }
+  }, [sala?.spinReq, currentUser]);
+
+  /* ---- Helper para guardar cambios (con estado de "guardando" para feedback visual) ---- */
+  const guardar = async (cambios) => {
+    setSaving(true);
+    try {
+      await setDoc(SALA_DOC, cambios, { merge: true });
+    } finally {
+      setSaving(false);
+    }
+  };
 
   /* ================= A PARTIR DE AQUÍ, RETURNS CONDICIONALES ================= */
 
@@ -279,17 +385,25 @@ export default function App() {
     );
   }
 
-  const tryLogin = () => {
-    const match = Object.keys(USERS).find((k) => USERS[k].pin === pin);
+  const tryLogin = (candidatePin) => {
+    const pinToCheck = candidatePin !== undefined ? candidatePin : pin;
+    const match = Object.keys(USERS).find((k) => USERS[k].pin === pinToCheck);
     if (match) {
+      vibrate(20); // #1 haptic de éxito
       setCurrentUser(match);
       setScreen("main");
       setPin("");
       setPinError(false);
+      // #4 pedir permiso de notificaciones al entrar (para poder avisar solicitudes de giro)
+      if (typeof Notification !== "undefined" && Notification.permission === "default") {
+        Notification.requestPermission();
+      }
     } else {
+      vibrate([15, 40, 15, 40, 15]); // #1 haptic de error (patrón distinto al de éxito)
       setPinError(true);
       setTimeout(() => setPinError(false), 600);
       setPin("");
+      pinBoxRefs.current[0]?.focus();
     }
   };
 
@@ -307,22 +421,41 @@ export default function App() {
           <h1 className="rp-display" style={{ color: C.texto, fontSize: 26, fontWeight: 800, margin: "0 0 4px" }}>Ruleta de Pelis</h1>
           <p style={{ color: C.sec, fontSize: 13, margin: "0 0 28px" }}>Ricardo & Catalina · noche de cine</p>
 
-          <div style={{ position: "relative", marginBottom: 8 }}>
-            <Lock size={16} color={C.sec} style={{ position: "absolute", left: 16, top: 17 }} />
-            <input
-              type="password" inputMode="numeric" value={pin} placeholder="Ingresa tu PIN"
-              onChange={(e) => setPin(e.target.value.replace(/\D/g, "").slice(0, 4))}
-              onKeyDown={(e) => e.key === "Enter" && tryLogin()}
-              className="rp-body"
-              style={{
-                width: "100%", padding: "15px 16px 15px 44px", borderRadius: 14, fontSize: 18, letterSpacing: 6,
-                background: C.cardHi, color: C.texto, textAlign: "center",
-                border: `2px solid ${pinError ? C.rojo : C.borde}`, outline: "none",
-                transition: "border 0.2s",
-              }}
-            />
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ display: "flex", gap: 10, justifyContent: "center" }} role="group" aria-label="Ingresa tu PIN de 4 dígitos">
+              {[0, 1, 2, 3].map((i) => (
+                <input
+                  key={i}
+                  ref={(el) => (pinBoxRefs.current[i] = el)}
+                  type="password" inputMode="numeric" maxLength={1}
+                  autoComplete="one-time-code"
+                  aria-label={`Dígito ${i + 1} del PIN`}
+                  value={pin[i] || ""}
+                  onChange={(e) => {
+                    const digit = e.target.value.replace(/\D/g, "").slice(-1);
+                    const next = (pin.slice(0, i) + digit + pin.slice(i + 1)).slice(0, 4);
+                    setPin(next);
+                    if (digit && i < 3) pinBoxRefs.current[i + 1]?.focus();
+                    if (digit && i === 3 && next.length === 4) {
+                      setTimeout(() => tryLogin(next), 120);
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Backspace" && !pin[i] && i > 0) pinBoxRefs.current[i - 1]?.focus();
+                    if (e.key === "Enter") tryLogin();
+                  }}
+                  className="rp-body"
+                  style={{
+                    width: 52, height: 60, borderRadius: 14, fontSize: 24, textAlign: "center",
+                    background: C.cardHi, color: C.texto,
+                    border: `2px solid ${pinError ? C.rojo : (pin[i] ? C.dorado : C.borde)}`,
+                    outline: "none", transition: "border 0.2s",
+                  }}
+                />
+              ))}
+            </div>
           </div>
-          {pinError && <p style={{ color: C.rojo, fontSize: 12, margin: "0 0 8px" }}>PIN incorrecto</p>}
+          {pinError && <p style={{ color: C.rojo, fontSize: 12, margin: "0 0 8px" }} role="alert">PIN incorrecto</p>}
 
           <button
             onClick={tryLogin}
@@ -382,6 +515,18 @@ export default function App() {
     <div className="rp-body" style={{ minHeight: "100vh", background: `radial-gradient(circle at 70% -10%, ${C.azulD}22, ${C.fondo} 50%)`, color: C.texto, paddingBottom: 40 }}>
       <FontStyles />
 
+      {/* #2 Toast: aviso cuando el estado de ánimo del otro cambia en tiempo real */}
+      {toast && (
+        <div className="rp-slideup" role="status" aria-live="polite" style={{
+          position: "fixed", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 60,
+          background: C.cardHi, border: `1px solid ${C.dorado}66`, borderRadius: 14,
+          padding: "10px 16px", fontSize: 13, color: C.texto, boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+          maxWidth: "90vw", textAlign: "center",
+        }}>
+          {toast}
+        </div>
+      )}
+
       <div style={{ position: "sticky", top: 0, zIndex: 10, background: `${C.fondo}ee`, backdropFilter: "blur(10px)", borderBottom: `1px solid ${C.borde}`, padding: "12px 16px" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", maxWidth: 460, margin: "0 auto" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -391,18 +536,18 @@ export default function App() {
               <div style={{ fontSize: 11, color: C.sec }}>{available.length} pelis en la ruleta</div>
             </div>
           </div>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button onClick={() => setShowHistory(true)} title="Historial"
-              style={{ width: 38, height: 38, borderRadius: 10, background: C.card, border: `1px solid ${C.borde}`, color: C.texto, cursor: "pointer", position: "relative" }}>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button onClick={() => setShowHistory(true)} title="Historial" aria-label="Ver historial de películas"
+              style={{ width: 44, height: 44, borderRadius: 10, background: C.card, border: `1px solid ${C.borde}`, color: C.texto, cursor: "pointer", position: "relative", display: "flex", alignItems: "center", justifyContent: "center" }}>
               <Eye size={17} />
               {pendientes.length > 0 ? (
-                <span style={{ position: "absolute", top: -6, right: -6, background: C.rojo, color: "#fff", fontSize: 10, fontWeight: 700, borderRadius: 8, padding: "1px 5px" }}>!</span>
+                <span style={{ position: "absolute", top: 2, right: 2, background: C.rojo, color: "#fff", fontSize: 10, fontWeight: 700, borderRadius: 8, padding: "1px 5px" }}>!</span>
               ) : sala.history.length > 0 && (
-                <span style={{ position: "absolute", top: -6, right: -6, background: C.verde, color: "#052e16", fontSize: 10, fontWeight: 700, borderRadius: 8, padding: "1px 5px" }}>{sala.history.length}</span>
+                <span style={{ position: "absolute", top: 2, right: 2, background: C.verde, color: "#052e16", fontSize: 10, fontWeight: 700, borderRadius: 8, padding: "1px 5px" }}>{sala.history.length}</span>
               )}
             </button>
-            <button onClick={() => { setScreen("login"); setCurrentUser(null); }} title="Salir"
-              style={{ width: 38, height: 38, borderRadius: 10, background: C.card, border: `1px solid ${C.borde}`, color: C.sec, cursor: "pointer" }}>
+            <button onClick={() => { setScreen("login"); setCurrentUser(null); }} title="Salir" aria-label="Cerrar sesión"
+              style={{ width: 44, height: 44, borderRadius: 10, background: C.card, border: `1px solid ${C.borde}`, color: C.sec, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
               <X size={17} />
             </button>
           </div>
@@ -422,7 +567,7 @@ export default function App() {
                   <div style={{ width: 8, height: 8, borderRadius: "50%", background: u.color }} />
                   <span style={{ fontSize: 12, color: C.sec, fontWeight: 500 }}>{u.name}{mine && " (tú)"}</span>
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <div key={`${est.label}-${est.emoji}`} className="rp-pop" style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <span style={{ fontSize: 22 }}>{est.emoji}</span>
                   <span className="rp-display" style={{ fontSize: 14, fontWeight: 600 }}>{est.label}</span>
                 </div>
@@ -446,9 +591,9 @@ export default function App() {
             )}
 
             {!sala.spinReq && !winner && pendientes.length === 0 && (
-              <button onClick={pedirGiro} disabled={available.length === 0} className="rp-display"
-                style={{ width: "100%", padding: "16px", borderRadius: 16, border: "none", cursor: available.length ? "pointer" : "not-allowed", fontSize: 17, fontWeight: 700, color: "#fff", background: available.length ? `linear-gradient(135deg, ${C.rojoBtn}, ${C.azulBtn})` : C.cardHi, opacity: available.length ? 1 : 0.5, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
-                <RotateCw size={19} /> Pedir girar
+              <button onClick={pedirGiro} disabled={available.length === 0 || saving} className="rp-display"
+                style={{ width: "100%", padding: "16px", borderRadius: 16, border: "none", cursor: (available.length && !saving) ? "pointer" : "not-allowed", fontSize: 17, fontWeight: 700, color: "#fff", background: available.length ? `linear-gradient(135deg, ${C.rojoBtn}, ${C.azulBtn})` : C.cardHi, opacity: (available.length && !saving) ? 1 : 0.55, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                <RotateCw size={19} className={saving ? "rp-pulse" : ""} /> {saving ? "Enviando…" : "Pedir girar"}
               </button>
             )}
 
@@ -501,13 +646,13 @@ export default function App() {
             <h2 className="rp-display" style={{ margin: "0 0 6px", fontSize: 21, fontWeight: 800 }}>¡{USERS[sala.spinReq.by].name} quiere girar!</h2>
             <p style={{ color: C.sec, fontSize: 14, margin: "0 0 22px" }}>¿Aceptas girar la ruleta juntos?</p>
             <div style={{ display: "flex", gap: 10 }}>
-              <button onClick={() => guardar({ spinReq: null })} className="rp-display"
-                style={{ flex: 1, padding: "14px", borderRadius: 14, border: `1px solid ${C.borde}`, background: "transparent", color: C.sec, fontWeight: 600, fontSize: 15, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <button onClick={() => guardar({ spinReq: null })} disabled={saving} className="rp-display"
+                style={{ flex: 1, padding: "14px", borderRadius: 14, border: `1px solid ${C.borde}`, background: "transparent", color: C.sec, fontWeight: 600, fontSize: 15, cursor: saving ? "not-allowed" : "pointer", opacity: saving ? 0.6 : 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
                 <X size={17} /> Ahora no
               </button>
-              <button onClick={() => guardar({ spinReq: { ...sala.spinReq, status: "approved" } })} className="rp-display"
-                style={{ flex: 1.4, padding: "14px", borderRadius: 14, border: "none", background: `linear-gradient(135deg, ${C.verdeBtn}, ${C.azulBtn})`, color: "#fff", fontWeight: 700, fontSize: 15, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-                <Check size={18} /> ¡Aceptar!
+              <button onClick={() => guardar({ spinReq: { ...sala.spinReq, status: "approved" } })} disabled={saving} className="rp-display"
+                style={{ flex: 1.4, padding: "14px", borderRadius: 14, border: "none", background: `linear-gradient(135deg, ${C.verdeBtn}, ${C.azulBtn})`, color: "#fff", fontWeight: 700, fontSize: 15, cursor: saving ? "not-allowed" : "pointer", opacity: saving ? 0.7 : 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                <Check size={18} /> {saving ? "Confirmando…" : "¡Aceptar!"}
               </button>
             </div>
           </div>
@@ -516,14 +661,17 @@ export default function App() {
 
       {winner && !registrando && (
         <div style={overlay}>
-          <div className="rp-pop" style={{ ...sheet, textAlign: "center" }}>
+          <div className="rp-pop" style={{ ...sheet, textAlign: "center", position: "relative", overflow: "hidden" }}>
+            <Confetti />
             <p style={{ color: C.dorado, fontWeight: 600, fontSize: 13, letterSpacing: 2, textTransform: "uppercase", margin: "0 0 10px" }}>✨ La ruleta eligió ✨</p>
             {(() => {
               const shownIdx = winner._num ?? 0;
               const col = SLICE_COLORS[shownIdx % 3];
               return <div className="rp-display" style={{ width: 44, height: 44, borderRadius: 12, background: col, color: "#fff", fontSize: 20, fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 10px" }}>{shownIdx + 1}</div>;
             })()}
-            <h2 className="rp-display" style={{ margin: "4px 0 2px", fontSize: 27, fontWeight: 800, background: `linear-gradient(135deg, ${C.verde}, ${C.rojo}, ${C.azul})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>{winner.title}</h2>
+            {/* #5 Texto blanco sólido (legible en cualquier título) + acento de color del gajo debajo, en vez de gradiente sobre el propio texto */}
+            <h2 className="rp-display" style={{ margin: "4px 0 6px", fontSize: 27, fontWeight: 800, color: C.texto }}>{winner.title}</h2>
+            <div style={{ width: 44, height: 3, borderRadius: 2, background: SLICE_COLORS[(winner._num ?? 0) % 3], margin: "0 auto 10px" }} />
             <p style={{ color: C.sec, fontSize: 13, margin: "0 0 20px" }}>{winner.genre} · {winner.year}</p>
 
             {showSynopsis && (
@@ -588,12 +736,23 @@ function ViewingForm({ movie, currentUser, onCancel, onSave }) {
   const [comida, setComida] = useState(draft.comida || "");
   const [rating, setRating] = useState(draft.rating || 0);
   const [miNota, setMiNota] = useState(draft.notas?.[currentUser] || "");
+  const [shake, setShake] = useState(false); // #6 feedback si intentan guardar vacío
 
   const other = currentUser === "ricardo" ? "catalina" : "ricardo";
   const otherUser = USERS[other];
   const otherNota = draft.notas?.[other] || "";
   const otherListo = otherNota.trim().length > 0;
   const puedoGuardar = miNota.trim().length > 0;
+
+  const intentarGuardar = () => {
+    if (puedoGuardar) {
+      onSave({ fecha, lugar, comida, rating, notas: miNota });
+    } else {
+      setShake(true);
+      vibrate(30);
+      setTimeout(() => setShake(false), 420);
+    }
+  };
 
   return (
     <div style={overlay}>
@@ -625,10 +784,12 @@ function ViewingForm({ movie, currentUser, onCancel, onSave }) {
         </Field>
 
         <Field icon={<Star size={15} />} label="Calificación">
-          <div style={{ display: "flex", gap: 6 }}>
+          <div style={{ display: "flex", gap: 2 }} role="radiogroup" aria-label="Calificación de 1 a 5 estrellas">
             {[1, 2, 3, 4, 5].map((n) => (
-              <button key={n} onClick={() => setRating(n)} style={{ background: "none", border: "none", cursor: "pointer", padding: 0 }}>
-                <Star size={28} color={C.dorado} fill={n <= rating ? C.dorado : "none"} />
+              <button key={n} onClick={() => setRating(n)}
+                role="radio" aria-checked={rating === n} aria-label={`Calificar con ${n} de 5 estrellas`}
+                style={{ background: "none", border: "none", cursor: "pointer", padding: 8, width: 44, height: 44, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <Star size={26} color={C.dorado} fill={n <= rating ? C.dorado : "none"} />
               </button>
             ))}
           </div>
@@ -649,7 +810,8 @@ function ViewingForm({ movie, currentUser, onCancel, onSave }) {
               value={miNota} onChange={(e) => setMiNota(e.target.value)}
               placeholder="Escribe lo que aprendiste o te gustó… (obligatorio)"
               rows={2}
-              style={{ ...inputS, resize: "vertical", borderColor: USERS[currentUser].color + "66" }} className="rp-body" />
+              className={`rp-body${shake ? " rp-shake" : ""}`}
+              style={{ ...inputS, resize: "vertical", borderColor: shake ? C.rojo : USERS[currentUser].color + "66" }} />
           </div>
 
           {/* Nota del otro (solo lectura) */}
@@ -664,8 +826,10 @@ function ViewingForm({ movie, currentUser, onCancel, onSave }) {
           </div>
         </div>
 
-        <button onClick={() => puedoGuardar && onSave({ fecha, lugar, comida, rating, notas: miNota })} disabled={!puedoGuardar} className="rp-display"
-          style={{ width: "100%", padding: "15px", borderRadius: 14, border: "none", background: puedoGuardar ? `linear-gradient(135deg, ${C.verdeBtn}, ${C.azulBtn})` : C.cardHi, color: puedoGuardar ? "#fff" : C.sec, fontWeight: 700, fontSize: 15, cursor: puedoGuardar ? "pointer" : "not-allowed", marginTop: 6, opacity: puedoGuardar ? 1 : 0.6 }}>
+        {/* Botón siempre "clickeable" (mejor accesibilidad: foco/lector de pantalla),
+            pero valida y da feedback (shake + vibración) si aún no hay nota propia */}
+        <button onClick={intentarGuardar} aria-disabled={!puedoGuardar} className="rp-display"
+          style={{ width: "100%", padding: "15px", borderRadius: 14, border: "none", background: puedoGuardar ? `linear-gradient(135deg, ${C.verdeBtn}, ${C.azulBtn})` : C.cardHi, color: puedoGuardar ? "#fff" : C.sec, fontWeight: 700, fontSize: 15, cursor: "pointer", marginTop: 6, opacity: puedoGuardar ? 1 : 0.75 }}>
           {otherListo ? "Guardar mi parte y completar registro" : "Guardar mi parte"}
         </button>
         {!puedoGuardar && <p style={{ margin: "8px 0 0", fontSize: 11.5, color: C.sec, textAlign: "center" }}>Escribe algo en tu campo para poder guardar</p>}

@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
-  Lock, Film, Play, Check, X, MapPin, Popcorn, Sparkles, Clock,
-  ChevronDown, RotateCw, Star, ArrowLeft, Users, Calendar, Eye, Heart
+  Film, Check, X, MapPin, Popcorn, Sparkles, Clock,
+  ChevronDown, RotateCw, Star, Calendar, Eye, Heart,
+  BellRing, BellOff, Wifi
 } from "lucide-react";
-import { db } from "./firebase";
-import { doc, onSnapshot, setDoc } from "firebase/firestore";
+import { db, VAPID_KEY, getMessagingSeguro } from "./firebase";
+import { doc, onSnapshot, setDoc, runTransaction, updateDoc, arrayUnion } from "firebase/firestore";
+import { getToken, onMessage } from "firebase/messaging";
 
 /* ============================================================
    PALETA (colores de Catalina: verde, rojo, azul)
@@ -13,8 +15,6 @@ const C = {
   verde: "#10B981",
   rojo: "#EF4444",
   azul: "#3B82F6",
-  verdeD: "#065F46",
-  rojoD: "#991B1B",
   azulD: "#1E40AF",
   // Tonos de botón (más oscuros, cumplen contraste AA 4.5:1 con texto blanco)
   verdeBtn: "#047857",
@@ -275,6 +275,8 @@ export default function App() {
   const [detalleHist, setDetalleHist] = useState(null);
   const [saving, setSaving] = useState(false);          // #8 loading en escrituras
   const [toast, setToast] = useState(null);              // #2 micro-toast de estado
+  const [pushEstado, setPushEstado] = useState("desconocido"); // push: desconocido | no-soportado | pendiente | activo | bloqueado
+  const [pushOcupado, setPushOcupado] = useState(false);
 
   const spinRef = useRef(false);           // ✅ ahora arriba, siempre se ejecuta
   const pinBoxRefs = useRef([]);            // #1 casillas de PIN
@@ -296,6 +298,7 @@ export default function App() {
             catalina: ESTADOS.find((e) => e.label === "Romántico/a"),
           },
           spinReq: null,
+          tokens: { ricardo: [], catalina: [] }, // tokens de push por dispositivo
         };
         await setDoc(SALA_DOC, inicial);
         setSala(inicial);
@@ -334,11 +337,11 @@ export default function App() {
     }
   }, [sala?.spinReq?.status]); // eslint-disable-line
 
-  /* ---- #2 Toast + notificación cuando el estado de ánimo del otro cambia ----
-     Debounce real: si cambia de estado varias veces seguidas, cada cambio nuevo
-     cancela (vía cleanup de useEffect) el aviso pendiente del cambio anterior.
-     Solo cuando la persona "se queda quieta" en un estado por 2.5s se envía UNA notificación. */
-  const NOTIF_ESTADO_DEBOUNCE_MS = 2500;
+  /* ---- Toast en pantalla cuando el estado de ánimo del otro cambia ----
+     Nota: las notificaciones con la app cerrada/en 2do plano ahora las manda la
+     Cloud Function (FCM). Aquí solo mostramos el aviso EN PANTALLA para cuando
+     la persona está mirando la app; si además disparáramos una Notification
+     desde el navegador, llegaría duplicada junto con la de FCM. */
   useEffect(() => {
     if (!currentUser || !sala?.estados) return undefined;
     const other = currentUser === "ricardo" ? "catalina" : "ricardo";
@@ -347,51 +350,116 @@ export default function App() {
     prevOtherEstado.current = nuevo;
     if (!cambio) return undefined;
 
-    // Toast en pantalla: se actualiza al instante con el estado más reciente
     setToast(`${USERS[other].name} ahora está ${nuevo.emoji} ${nuevo.label}`);
     vibrate(15);
     const toastTimer = setTimeout(() => setToast(null), 3200);
-
-    // Notificación del navegador: espera a que se "asiente" el cambio antes de avisar
-    const notifTimer = setTimeout(() => {
-      if (typeof Notification !== "undefined" && Notification.permission === "granted" && document.hidden) {
-        try {
-          new Notification(`${nuevo.emoji} ${USERS[other].name} cambió su estado`, {
-            body: `Ahora está ${nuevo.label}`,
-            tag: "ruleta-estado", // mismo tag = si por algo llegaran 2, la 2da reemplaza a la 1ra en vez de duplicar
-          });
-        } catch (e) { /* silencioso */ }
-      }
-    }, NOTIF_ESTADO_DEBOUNCE_MS);
-
-    // Cleanup: si el efecto vuelve a correr antes de que pase el debounce
-    // (osea, la persona cambió de estado de nuevo), cancela el aviso anterior sin enviarlo.
-    return () => {
-      clearTimeout(toastTimer);
-      clearTimeout(notifTimer);
-    };
+    return () => clearTimeout(toastTimer);
   }, [sala?.estados, currentUser]);
 
-  /* ---- #4 Notificación del navegador cuando piden girar (si la pestaña está en 2do plano) ---- */
+  /* ---- Vibración cuando piden girar y la app está abierta ----
+     (la notificación con la app cerrada la manda la Cloud Function) */
   useEffect(() => {
     if (!currentUser) return;
     const req = sala?.spinReq;
     const reqId = req ? `${req.by}-${req.seed}` : null;
-    if (
-      req && req.status === "pending" && req.by !== currentUser &&
-      reqId !== notifiedReqRef.current
-    ) {
+    if (req && req.status === "pending" && req.by !== currentUser && reqId !== notifiedReqRef.current) {
       notifiedReqRef.current = reqId;
       vibrate([25, 60, 25]);
-      if (typeof Notification !== "undefined") {
-        if (Notification.permission === "granted" && document.hidden) {
-          try { new Notification("🎡 ¡Quieren girar la ruleta!", { body: `${USERS[req.by].name} está esperando tu aprobación`, tag: "ruleta-spin" }); } catch (e) {}
-        } else if (Notification.permission === "default") {
-          Notification.requestPermission();
-        }
-      }
     }
   }, [sala?.spinReq, currentUser]);
+
+  /* ---- Detectar el estado del permiso de push al cargar ---- */
+  useEffect(() => {
+    let cancelado = false;
+    (async () => {
+      const messaging = await getMessagingSeguro();
+      if (cancelado) return;
+      if (!messaging || typeof Notification === "undefined") {
+        setPushEstado("no-soportado");
+        return;
+      }
+      if (Notification.permission === "granted") setPushEstado("activo");
+      else if (Notification.permission === "denied") setPushEstado("bloqueado");
+      else setPushEstado("pendiente");
+    })();
+    return () => { cancelado = true; };
+  }, []);
+
+  /* ---- Escuchar mensajes de FCM con la app EN PRIMER PLANO ----
+     El Service Worker solo maneja los mensajes en segundo plano; si la app está
+     abierta, llegan por aquí. Mostramos un toast en vez de una notificación del
+     sistema, que sería molesta estando la persona mirando la pantalla. */
+  useEffect(() => {
+    if (pushEstado !== "activo" || !currentUser) return undefined;
+    let unsub = () => {};
+    (async () => {
+      const messaging = await getMessagingSeguro();
+      if (!messaging) return;
+      unsub = onMessage(messaging, (payload) => {
+        const d = payload.data || {};
+        if (d.title) {
+          setToast(`${d.title}${d.body ? ` · ${d.body}` : ""}`);
+          setTimeout(() => setToast(null), 3500);
+        }
+      });
+    })();
+    return () => unsub();
+  }, [pushEstado, currentUser]);
+
+  /* ---- Registrar el token de este dispositivo para poder recibir push ----
+     Cada celular genera un token único. Lo guardamos en Firestore bajo el usuario
+     logueado (en un array, porque una persona puede usar varios dispositivos).
+     La Cloud Function lee estos tokens para saber a dónde mandar el aviso. */
+  const registrarTokenPush = async (usuario) => {
+    try {
+      const messaging = await getMessagingSeguro();
+      if (!messaging) return null;
+      const registro = await navigator.serviceWorker.register("/firebase-messaging-sw.js");
+      const token = await getToken(messaging, {
+        vapidKey: VAPID_KEY,
+        serviceWorkerRegistration: registro,
+      });
+      if (!token) return null;
+      // arrayUnion no duplica si el token ya estaba guardado
+      await updateDoc(SALA_DOC, { [`tokens.${usuario}`]: arrayUnion(token) });
+      return token;
+    } catch (e) {
+      console.warn("No se pudo registrar el token de push:", e);
+      return null;
+    }
+  };
+
+  /* ---- Activar push (lo dispara el usuario con un botón, no automáticamente) ----
+     Los navegadores exigen que la solicitud de permiso venga de un gesto del usuario,
+     y además pedirlo de golpe al entrar hace que mucha gente lo rechace por reflejo. */
+  const activarPush = async () => {
+    if (typeof Notification === "undefined") return;
+    setPushOcupado(true);
+    try {
+      const permiso = await Notification.requestPermission();
+      if (permiso === "granted") {
+        const token = await registrarTokenPush(currentUser);
+        setPushEstado(token ? "activo" : "no-soportado");
+        if (token) {
+          setToast("🔔 Notificaciones activadas en este dispositivo");
+          setTimeout(() => setToast(null), 3000);
+        }
+      } else if (permiso === "denied") {
+        setPushEstado("bloqueado");
+      }
+    } finally {
+      setPushOcupado(false);
+    }
+  };
+
+  /* ---- Si el permiso ya estaba dado, refrescamos el token al entrar ----
+     El token puede cambiar (reinstalación, limpieza de datos del navegador), así
+     que lo re-registramos en cada login en vez de asumir que el guardado sigue vivo. */
+  useEffect(() => {
+    if (pushEstado === "activo" && currentUser && sala) {
+      registrarTokenPush(currentUser);
+    }
+  }, [pushEstado, currentUser, !!sala]); // eslint-disable-line
 
   /* ---- Helper para guardar cambios (con estado de "guardando" para feedback visual) ---- */
   const guardar = async (cambios) => {
@@ -435,10 +503,6 @@ export default function App() {
       setScreen("main");
       setPin("");
       setPinError(false);
-      // #4 pedir permiso de notificaciones al entrar (para poder avisar solicitudes de giro)
-      if (typeof Notification !== "undefined" && Notification.permission === "default") {
-        Notification.requestPermission();
-      }
     } else {
       vibrate([15, 40, 15, 40, 15]); // #1 haptic de error (patrón distinto al de éxito)
       setPinError(true);
@@ -533,23 +597,41 @@ export default function App() {
     setShowSynopsis(false);
   };
 
-  const guardarParte = (movie, data) => {
-    const draftPrevio = movie.draft || { notas: {} };
-    const notasNuevas = { ...draftPrevio.notas, [currentUser]: data.notas };
-    const draft = { fecha: data.fecha, lugar: data.lugar, comida: data.comida, rating: data.rating, notas: notasNuevas };
-    const completo = notasNuevas.ricardo?.trim() && notasNuevas.catalina?.trim();
+  /* FIX condición de carrera: antes se usaba `movie.draft` (la "foto" tomada
+     cuando se abrió el formulario), que podía quedar vieja si la otra persona
+     guardaba su nota mientras esta seguía escribiendo — al guardar, se perdía
+     la nota ajena. Ahora usamos una transacción de Firestore: lee el documento
+     REAL justo en el instante de guardar (no antes) y, si detecta que alguien
+     más escribió en el medio, reintenta sola con el dato más fresco. */
+  const guardarParte = async (movie, data) => {
+    setSaving(true);
+    try {
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(SALA_DOC);
+        const current = snap.data();
+        const currentMovie = current.movies.find((m) => m.id === movie.id);
+        if (!currentMovie) return; // la película ya no existe en ese estado (caso raro)
 
-    if (completo) {
-      guardar({
-        movies: sala.movies.map((m) => (m.id === movie.id ? { ...m, state: "vista", draft: null } : m)),
-        history: [{ ...draft, movieId: movie.id, movie, id: Date.now() }, ...sala.history],
+        const draftPrevio = currentMovie.draft || { notas: {} };
+        const notasNuevas = { ...draftPrevio.notas, [currentUser]: data.notas };
+        const draft = { fecha: data.fecha, lugar: data.lugar, comida: data.comida, rating: data.rating, notas: notasNuevas };
+        const completo = notasNuevas.ricardo?.trim() && notasNuevas.catalina?.trim();
+
+        if (completo) {
+          tx.set(SALA_DOC, {
+            movies: current.movies.map((m) => (m.id === movie.id ? { ...m, state: "vista", draft: null } : m)),
+            history: [{ ...draft, movieId: movie.id, movie: currentMovie, id: Date.now() }, ...current.history],
+          }, { merge: true });
+        } else {
+          tx.set(SALA_DOC, {
+            movies: current.movies.map((m) => (m.id === movie.id ? { ...m, draft } : m)),
+          }, { merge: true });
+        }
       });
-    } else {
-      guardar({
-        movies: sala.movies.map((m) => (m.id === movie.id ? { ...m, draft } : m)),
-      });
+    } finally {
+      setSaving(false);
+      setRegistrando(null);
     }
-    setRegistrando(null);
   };
 
   return (
@@ -654,10 +736,12 @@ export default function App() {
           </div>
         </div>
 
-        <div style={{ background: `${C.azul}12`, border: `1px dashed ${C.azul}66`, borderRadius: 14, padding: "10px 14px", display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: C.sec }}>
-          <Users size={16} color={C.azul} />
-          <span>Conectado a Firebase · sincronizado en tiempo real</span>
-        </div>
+        <PushBanner
+          estado={pushEstado}
+          ocupado={pushOcupado}
+          onActivar={activarPush}
+          nombreOtro={USERS[other].name}
+        />
       </div>
 
       {showEstadoPicker && (
@@ -774,6 +858,92 @@ export default function App() {
    ============================================================ */
 const overlay = { position: "fixed", inset: 0, background: "rgba(3,7,18,0.75)", backdropFilter: "blur(4px)", display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 50, padding: 12 };
 const sheet = { background: C.card, border: `1px solid ${C.borde}`, borderRadius: 24, padding: "26px 22px", width: "100%", maxWidth: 420, marginBottom: 8 };
+
+/* ============================================================
+   PushBanner — invitación a activar las notificaciones
+   ------------------------------------------------------------
+   Diseño: se apoya en el lenguaje visual que ya tiene la app —
+   el dorado está reservado para los momentos "de evento" (el
+   puntero de la ruleta, "la ruleta eligió"), así que aquí lo
+   usamos para que esto se lea como una invitación cálida y no
+   como una alerta del sistema. La campana late suavemente para
+   atraer la mirada sin gritar.
+   ============================================================ */
+function PushBanner({ estado, ocupado, onActivar, nombreOtro }) {
+  if (estado === "no-soportado" || estado === "desconocido") return null;
+
+  if (estado === "activo") {
+    return (
+      <div style={{ background: `${C.verde}10`, border: `1px solid ${C.verde}33`, borderRadius: 14, padding: "10px 14px", display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: C.sec }}>
+        <Wifi size={15} color={C.verde} />
+        <span>Notificaciones activas · sincronizado en tiempo real</span>
+      </div>
+    );
+  }
+
+  if (estado === "bloqueado") {
+    return (
+      <div style={{ background: `${C.cardHi}`, border: `1px solid ${C.borde}`, borderRadius: 14, padding: "12px 14px", display: "flex", alignItems: "flex-start", gap: 10 }}>
+        <BellOff size={16} color={C.sec} style={{ flexShrink: 0, marginTop: 2 }} />
+        <div>
+          <div className="rp-display" style={{ fontSize: 13, fontWeight: 600, color: C.texto, marginBottom: 2 }}>
+            Notificaciones bloqueadas
+          </div>
+          <p style={{ margin: 0, fontSize: 11.5, color: C.sec, lineHeight: 1.5 }}>
+            Las bloqueaste antes, así que el navegador ya no me deja preguntarte.
+            Para reactivarlas: toca el candado 🔒 en la barra de direcciones → Notificaciones → Permitir.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // estado === "pendiente" → la invitación
+  return (
+    <div style={{
+      position: "relative", overflow: "hidden",
+      background: `linear-gradient(135deg, ${C.dorado}14, ${C.rojo}0D 60%, ${C.azul}14)`,
+      border: `1px solid ${C.dorado}55`, borderRadius: 18, padding: "16px 16px 14px",
+    }}>
+      {/* Halo decorativo detrás de la campana, para dar profundidad */}
+      <div aria-hidden="true" style={{
+        position: "absolute", top: -30, left: -20, width: 120, height: 120, borderRadius: "50%",
+        background: `radial-gradient(circle, ${C.dorado}22, transparent 70%)`, pointerEvents: "none",
+      }} />
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, position: "relative" }}>
+        <div className="rp-pulse" style={{
+          width: 34, height: 34, borderRadius: 10, flexShrink: 0,
+          background: `${C.dorado}1F`, border: `1px solid ${C.dorado}44`,
+          display: "flex", alignItems: "center", justifyContent: "center",
+        }}>
+          <BellRing size={17} color={C.dorado} />
+        </div>
+        <div>
+          <div className="rp-display" style={{ fontSize: 15, fontWeight: 700, color: C.texto, lineHeight: 1.2 }}>
+            No te pierdas ningún giro
+          </div>
+          <div style={{ fontSize: 11.5, color: C.sec, marginTop: 2 }}>
+            Te aviso cuando {nombreOtro} quiera girar, aunque tengas la app cerrada
+          </div>
+        </div>
+      </div>
+
+      <button onClick={onActivar} disabled={ocupado} className="rp-display"
+        style={{
+          width: "100%", padding: "12px", borderRadius: 12, border: "none",
+          background: `linear-gradient(135deg, ${C.verdeBtn}, ${C.azulBtn})`,
+          color: "#fff", fontWeight: 700, fontSize: 14,
+          cursor: ocupado ? "wait" : "pointer", opacity: ocupado ? 0.7 : 1,
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+          position: "relative",
+        }}>
+        <BellRing size={16} className={ocupado ? "rp-pulse" : ""} />
+        {ocupado ? "Activando…" : "Activar notificaciones"}
+      </button>
+    </div>
+  );
+}
 
 function Modal({ title, children, onClose }) {
   return (
@@ -907,7 +1077,7 @@ function Field({ icon, label, children }) {
   );
 }
 
-const inputS = { width: "100%", padding: "12px 14px", borderRadius: 12, background: C.cardHi, color: C.texto, border: `1px solid ${C.borde}`, outline: "none", fontSize: 14 };
+const inputS = { width: "100%", padding: "12px 14px", borderRadius: 12, background: C.cardHi, color: C.texto, border: `1px solid ${C.borde}`, outline: "none", fontSize: 16 }; // 16px: evita el auto-zoom de iOS al enfocar
 
 function HistoryPanel({ history, pendientes, onClose, onSelect, onRegistrar }) {
   return (

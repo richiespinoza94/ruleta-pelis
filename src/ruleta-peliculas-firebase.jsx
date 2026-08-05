@@ -275,7 +275,8 @@ export default function App() {
   const [detalleHist, setDetalleHist] = useState(null);
   const [saving, setSaving] = useState(false);          // #8 loading en escrituras
   const [toast, setToast] = useState(null);              // #2 micro-toast de estado
-  const [pushEstado, setPushEstado] = useState("desconocido"); // push: desconocido | no-soportado | pendiente | activo | bloqueado
+  const [pushEstado, setPushEstado] = useState("desconocido"); // push: desconocido | no-soportado | pendiente | activo | bloqueado | error
+  const [pushErrorMsg, setPushErrorMsg] = useState(null);
   const [pushOcupado, setPushOcupado] = useState(false);
 
   const spinRef = useRef(false);           // ✅ ahora arriba, siempre se ejecuta
@@ -409,23 +410,36 @@ export default function App() {
   /* ---- Registrar el token de este dispositivo para poder recibir push ----
      Cada celular genera un token único. Lo guardamos en Firestore bajo el usuario
      logueado (en un array, porque una persona puede usar varios dispositivos).
-     La Cloud Function lee estos tokens para saber a dónde mandar el aviso. */
+     La Cloud Function lee estos tokens para saber a dónde mandar el aviso.
+
+     FIX: antes, cualquier error acá (VAPID mal copiada, Service Worker sin
+     registrar a tiempo, red, etc.) se tragaba en silencio con un console.warn
+     que nadie ve en el celular — el banner simplemente desaparecía sin avisar
+     nada, pareciendo "activado" cuando en realidad NUNCA se guardó el token,
+     y sin token la Cloud Function no tiene a quién mandarle el aviso. Ahora
+     devolvemos el motivo real del fallo para poder mostrarlo en pantalla. */
   const registrarTokenPush = async (usuario) => {
     try {
       const messaging = await getMessagingSeguro();
-      if (!messaging) return null;
+      if (!messaging) return { token: null, error: "Este navegador no soporta notificaciones push" };
+
       const registro = await navigator.serviceWorker.register("/firebase-messaging-sw.js");
+      // Esperamos a que el Service Worker esté LISTO (activo), no solo registrado.
+      // Pedir el token antes de que esté activo es una causa común de fallo silencioso.
+      await navigator.serviceWorker.ready;
+
       const token = await getToken(messaging, {
         vapidKey: VAPID_KEY,
         serviceWorkerRegistration: registro,
       });
-      if (!token) return null;
-      // arrayUnion no duplica si el token ya estaba guardado
+      if (!token) return { token: null, error: "Firebase no devolvió un token (revisa la clave VAPID)" };
+
       await updateDoc(SALA_DOC, { [`tokens.${usuario}`]: arrayUnion(token) });
-      return token;
+      return { token, error: null };
     } catch (e) {
-      console.warn("No se pudo registrar el token de push:", e);
-      return null;
+      console.error("Fallo al registrar token de push:", e);
+      const motivo = (e && e.code) || (e && e.message) || "Error desconocido";
+      return { token: null, error: motivo };
     }
   };
 
@@ -438,11 +452,16 @@ export default function App() {
     try {
       const permiso = await Notification.requestPermission();
       if (permiso === "granted") {
-        const token = await registrarTokenPush(currentUser);
-        setPushEstado(token ? "activo" : "no-soportado");
+        const { token, error } = await registrarTokenPush(currentUser);
         if (token) {
+          setPushEstado("activo");
           setToast("🔔 Notificaciones activadas en este dispositivo");
           setTimeout(() => setToast(null), 3000);
+        } else {
+          // FIX: antes esto quedaba en "no-soportado" (silencioso). Ahora mostramos
+          // el motivo real para poder diagnosticarlo en vez de adivinar.
+          setPushEstado("error");
+          setPushErrorMsg(error || "No se pudo completar el registro");
         }
       } else if (permiso === "denied") {
         setPushEstado("bloqueado");
@@ -457,7 +476,9 @@ export default function App() {
      que lo re-registramos en cada login en vez de asumir que el guardado sigue vivo. */
   useEffect(() => {
     if (pushEstado === "activo" && currentUser && sala) {
-      registrarTokenPush(currentUser);
+      registrarTokenPush(currentUser).then(({ error }) => {
+        if (error) console.warn("Refresco de token falló (silencioso, ya estaba activo antes):", error);
+      });
     }
   }, [pushEstado, currentUser, !!sala]); // eslint-disable-line
 
@@ -741,6 +762,7 @@ export default function App() {
           ocupado={pushOcupado}
           onActivar={activarPush}
           nombreOtro={USERS[other].name}
+          errorMsg={pushErrorMsg}
         />
       </div>
 
@@ -869,7 +891,7 @@ const sheet = { background: C.card, border: `1px solid ${C.borde}`, borderRadius
    como una alerta del sistema. La campana late suavemente para
    atraer la mirada sin gritar.
    ============================================================ */
-function PushBanner({ estado, ocupado, onActivar, nombreOtro }) {
+function PushBanner({ estado, ocupado, onActivar, nombreOtro, errorMsg }) {
   if (estado === "no-soportado" || estado === "desconocido") return null;
 
   if (estado === "activo") {
@@ -877,6 +899,29 @@ function PushBanner({ estado, ocupado, onActivar, nombreOtro }) {
       <div style={{ background: `${C.verde}10`, border: `1px solid ${C.verde}33`, borderRadius: 14, padding: "10px 14px", display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: C.sec }}>
         <Wifi size={15} color={C.verde} />
         <span>Notificaciones activas · sincronizado en tiempo real</span>
+      </div>
+    );
+  }
+
+  if (estado === "error") {
+    return (
+      <div style={{ background: `${C.rojo}10`, border: `1px solid ${C.rojo}44`, borderRadius: 14, padding: "12px 14px" }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 10 }}>
+          <BellOff size={16} color={C.rojo} style={{ flexShrink: 0, marginTop: 2 }} />
+          <div>
+            <div className="rp-display" style={{ fontSize: 13, fontWeight: 600, color: C.texto, marginBottom: 2 }}>
+              No se pudo activar
+            </div>
+            <p style={{ margin: 0, fontSize: 11.5, color: C.sec, lineHeight: 1.5 }}>
+              El permiso quedó dado, pero algo falló al registrar este dispositivo.
+              {errorMsg && <><br /><code style={{ color: C.rojo, fontSize: 10.5 }}>{errorMsg}</code></>}
+            </p>
+          </div>
+        </div>
+        <button onClick={onActivar} disabled={ocupado} className="rp-display"
+          style={{ width: "100%", padding: "10px", borderRadius: 10, border: `1px solid ${C.rojo}66`, background: "transparent", color: C.texto, fontWeight: 600, fontSize: 13, cursor: ocupado ? "wait" : "pointer" }}>
+          {ocupado ? "Reintentando…" : "Reintentar"}
+        </button>
       </div>
     );
   }

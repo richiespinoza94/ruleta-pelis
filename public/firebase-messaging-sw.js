@@ -39,7 +39,10 @@ messaging.onBackgroundMessage((payload) => {
     badge: "/icon-192.png",
     // Mismo tag = una notificación reemplaza a la anterior en vez de apilarse
     tag: d.tag || "ruleta-general",
-    renotify: true,
+    // FIX: antes esto quedaba fijo en `true` sin importar lo que mandara la
+    // función — los cambios de estado (que piden renotify:false, para
+    // reemplazar en silencio) igual vibraban cada vez. Ahora respeta el valor real.
+    renotify: d.renotify === "true",
     data: { url: d.url || "/" },
     vibrate: [40, 60, 40],
   };

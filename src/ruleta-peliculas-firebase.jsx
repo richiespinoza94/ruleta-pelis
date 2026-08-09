@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   Film, Check, X, MapPin, Popcorn, Sparkles, Clock,
-  ChevronDown, RotateCw, Star, Calendar, Eye, Heart,
-  BellRing, BellOff, Wifi
+  ChevronDown, ChevronLeft, RotateCw, Star, Calendar, Eye, Heart,
+  BellRing, BellOff, Wifi, BookOpen, Link2, User, Wand2
 } from "lucide-react";
-import { db, VAPID_KEY, getMessagingSeguro } from "./firebase";
+import { db, VAPID_KEY, getMessagingSeguro, obtenerMetadatosEnlace } from "./firebase";
 import { doc, onSnapshot, setDoc, runTransaction, updateDoc, arrayUnion } from "firebase/firestore";
 import { getToken, onMessage } from "firebase/messaging";
 
@@ -80,6 +80,47 @@ const PELICULAS_INICIALES = [
 ];
 
 const SLICE_COLORS = [C.verde, C.rojo, C.azul];
+
+/* ============================================================
+   Utilidades de lista para historiales grandes (películas y lecturas)
+   ------------------------------------------------------------
+   Funciones puras (sin estado, sin React) para poder probarlas
+   de forma aislada. Todo corre en memoria del celular — Firestore
+   ya sincroniza el documento completo, así que filtrar/ordenar
+   acá no es una consulta nueva, es un .filter()/.sort() normal.
+   ============================================================ */
+const PAGINA = 10; // "Ver 10 más" — ver conversación de diseño para el porqué de 10
+
+function buscarEnHistorial(items, query, campos) {
+  const q = query.trim().toLowerCase();
+  if (!q) return items;
+  return items.filter((it) =>
+    campos.some((campo) => (campo(it) || "").toLowerCase().includes(q))
+  );
+}
+
+function ordenarHistorial(items, criterio, getTitulo = (it) => it.titulo || "") {
+  const copia = [...items];
+  if (criterio === "reciente") return copia.sort((a, b) => (b.id || 0) - (a.id || 0));
+  if (criterio === "antiguo") return copia.sort((a, b) => (a.id || 0) - (b.id || 0));
+  if (criterio === "calificacion") return copia.sort((a, b) => (b.rating || 0) - (a.rating || 0));
+  if (criterio === "az") return copia.sort((a, b) => getTitulo(a).localeCompare(getTitulo(b), "es"));
+  return copia;
+}
+
+/* Agrupa por año, a partir del campo `fecha` (string "YYYY-MM-DD").
+   Devuelve un array de [año, items[]] ya en el orden en que llegaron
+   (asumimos que `items` ya viene ordenado — esta función no reordena). */
+function agruparPorAnio(items) {
+  const grupos = new Map();
+  for (const it of items) {
+    const anio = (it.fecha || "").slice(0, 4) || "Sin fecha";
+    if (!grupos.has(anio)) grupos.set(anio, []);
+    grupos.get(anio).push(it);
+  }
+  return Array.from(grupos.entries());
+}
+
 
 /* Vibración háptica — no-op en navegadores/dispositivos sin soporte (ej. iOS Safari) */
 const vibrate = (pattern) => {
@@ -273,6 +314,11 @@ export default function App() {
   const [registrando, setRegistrando] = useState(null);
   const [showHistory, setShowHistory] = useState(false);
   const [detalleHist, setDetalleHist] = useState(null);
+  // --- Lecturas ---
+  const [showAddLectura, setShowAddLectura] = useState(false);
+  const [compartiendo, setCompartiendo] = useState(null); // lectura sobre la que se está compartiendo impresión
+  const [showLecturasHistorial, setShowLecturasHistorial] = useState(false);
+  const [lecturaDetalle, setLecturaDetalle] = useState(null);
   const [saving, setSaving] = useState(false);          // #8 loading en escrituras
   const [toast, setToast] = useState(null);              // #2 micro-toast de estado
   const [pushEstado, setPushEstado] = useState("desconocido"); // push: desconocido | no-soportado | pendiente | activo | bloqueado | error
@@ -289,11 +335,19 @@ export default function App() {
   useEffect(() => {
     const unsub = onSnapshot(SALA_DOC, async (snap) => {
       if (snap.exists()) {
-        setSala(snap.data());
+        const data = snap.data();
+        // Migración suave: si el documento es de antes de agregar Lecturas, no tiene ese campo.
+        // Lo completamos localmente para no romper nada; se guarda solo, sin bloquear la carga.
+        if (!data.lecturas) {
+          data.lecturas = [];
+          setDoc(SALA_DOC, { lecturas: [] }, { merge: true }).catch(() => {});
+        }
+        setSala(data);
       } else {
         const inicial = {
           movies: PELICULAS_INICIALES,
           history: [],
+          lecturas: [],
           estados: {
             ricardo: ESTADOS.find((e) => e.label === "Feliz"),
             catalina: ESTADOS.find((e) => e.label === "Romántico/a"),
@@ -521,7 +575,7 @@ export default function App() {
     if (match) {
       vibrate(20); // #1 haptic de éxito
       setCurrentUser(match);
-      setScreen("main");
+      setScreen("hub");
       setPin("");
       setPinError(false);
     } else {
@@ -636,7 +690,7 @@ export default function App() {
         const draftPrevio = currentMovie.draft || { notas: {} };
         const notasNuevas = { ...draftPrevio.notas, [currentUser]: data.notas };
         const draft = { fecha: data.fecha, lugar: data.lugar, comida: data.comida, rating: data.rating, notas: notasNuevas };
-        const completo = notasNuevas.ricardo?.trim() && notasNuevas.catalina?.trim();
+        const completo = !!(notasNuevas.ricardo?.trim() && notasNuevas.catalina?.trim());
 
         if (completo) {
           tx.set(SALA_DOC, {
@@ -654,6 +708,220 @@ export default function App() {
       setRegistrando(null);
     }
   };
+
+  /* ---- Agregar una lectura nueva (no pasa por "aprobación", a diferencia del giro:
+     no hay nada que sortear, así que se agrega directo) ---- */
+  const agregarLectura = (datos) => {
+    const nueva = {
+      id: Date.now(),
+      titulo: datos.titulo,
+      autor: datos.autor,
+      enlace: datos.enlace,
+      contexto: datos.contexto,
+      state: "pendiente",
+      draft: { impresiones: {}, metas: {} },
+    };
+    guardar({ lecturas: [nueva, ...(sala.lecturas || [])] });
+    setShowAddLectura(false);
+  };
+
+  /* ---- Guardar impresión/meta de una lectura (mismo patrón anti-condición-de-carrera
+     que guardarParte para películas: lee el dato fresco con una transacción, no la
+     "foto" que se tomó al abrir el formulario) ---- */
+  const guardarParteLectura = async (lectura, data) => {
+    setSaving(true);
+    try {
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(SALA_DOC);
+        const current = snap.data();
+        const currentLectura = (current.lecturas || []).find((l) => l.id === lectura.id);
+        if (!currentLectura) return;
+
+        const draftPrevio = currentLectura.draft || { impresiones: {}, metas: {} };
+        const impresionesNuevas = { ...draftPrevio.impresiones, [currentUser]: data.impresion };
+        const metasNuevas = { ...draftPrevio.metas, [currentUser]: data.meta };
+        const completo = !!(impresionesNuevas.ricardo?.trim() && impresionesNuevas.catalina?.trim());
+
+        const lecturasActualizadas = current.lecturas.map((l) => {
+          if (l.id !== lectura.id) return l;
+          if (completo) {
+            return {
+              ...l,
+              state: "compartido",
+              fecha: data.fecha,
+              impresiones: impresionesNuevas,
+              metas: metasNuevas,
+              draft: null,
+            };
+          }
+          return { ...l, draft: { impresiones: impresionesNuevas, metas: metasNuevas, fecha: data.fecha } };
+        });
+
+        tx.set(SALA_DOC, { lecturas: lecturasActualizadas }, { merge: true });
+      });
+    } finally {
+      setSaving(false);
+      setCompartiendo(null);
+    }
+  };
+
+  /* ================= HUB — elegir actividad ================= */
+  if (screen === "hub") {
+    return (
+      <div className="rp-body" style={{ minHeight: "100vh", background: `radial-gradient(circle at 70% -10%, ${C.azulD}22, ${C.fondo} 50%)`, color: C.texto, paddingBottom: 40 }}>
+        <FontStyles />
+        <div style={{ position: "sticky", top: 0, zIndex: 10, background: `${C.fondo}ee`, backdropFilter: "blur(10px)", borderBottom: `1px solid ${C.borde}`, padding: "12px 16px" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", maxWidth: 460, margin: "0 auto" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ width: 36, height: 36, borderRadius: "50%", background: me.color, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, color: "#fff" }} className="rp-display">{me.initial}</div>
+              <div>
+                <div className="rp-display" style={{ fontSize: 15, fontWeight: 700, lineHeight: 1 }}>Hola, {me.name}</div>
+                <div style={{ fontSize: 11, color: C.sec }}>Elige qué hacer juntos</div>
+              </div>
+            </div>
+            <button onClick={() => { setScreen("login"); setCurrentUser(null); }} title="Salir" aria-label="Cerrar sesión"
+              style={{ width: 44, height: 44, borderRadius: 10, background: C.card, border: `1px solid ${C.borde}`, color: C.sec, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <X size={17} />
+            </button>
+          </div>
+        </div>
+
+        <div style={{ maxWidth: 460, margin: "0 auto", padding: "20px 16px", display: "flex", flexDirection: "column", gap: 12 }}>
+          <button onClick={() => setScreen("main")} className="rp-pop"
+            style={{ textAlign: "left", background: C.card, border: `1px solid ${C.borde}`, borderRadius: 18, padding: 18, display: "flex", alignItems: "center", gap: 14, cursor: "pointer" }}>
+            <div style={{ width: 48, height: 48, borderRadius: 14, background: `linear-gradient(135deg, ${C.verde}22, ${C.azul}22)`, border: `1px solid ${C.verde}55`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <Film size={22} color={C.verde} />
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="rp-display" style={{ fontSize: 16, fontWeight: 700, color: C.texto }}>Ruleta de pelis</div>
+              <div style={{ color: C.sec, fontSize: 12, marginTop: 2 }}>Giren y descubran qué ver</div>
+            </div>
+          </button>
+
+          <button onClick={() => setScreen("lecturas")} className="rp-pop"
+            style={{ textAlign: "left", background: C.card, border: `1px solid ${C.borde}`, borderRadius: 18, padding: 18, display: "flex", alignItems: "center", gap: 14, cursor: "pointer" }}>
+            <div style={{ width: 48, height: 48, borderRadius: 14, background: `linear-gradient(135deg, ${C.rojo}22, ${C.dorado}22)`, border: `1px solid ${C.rojo}55`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <BookOpen size={22} color={C.rojo} />
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="rp-display" style={{ fontSize: 16, fontWeight: 700, color: C.texto }}>Lecturas juntos</div>
+              <div style={{ color: C.sec, fontSize: 12, marginTop: 2 }}>Guarden lo que sintieron leyendo</div>
+            </div>
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  /* ================= LECTURAS ================= */
+  if (screen === "lecturas") {
+    const lecturasArr = sala.lecturas || [];
+    const lecturasPendientes = lecturasArr.filter((l) => l.state === "pendiente");
+    const lecturasCompartidas = lecturasArr.filter((l) => l.state === "compartido");
+
+    return (
+      <div className="rp-body" style={{ minHeight: "100vh", background: `radial-gradient(circle at 70% -10%, ${C.azulD}22, ${C.fondo} 50%)`, color: C.texto, paddingBottom: 40 }}>
+        <FontStyles />
+
+        {toast && (
+          <div className="rp-slideup" role="status" aria-live="polite" style={{
+            position: "fixed", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 60,
+            background: C.cardHi, border: `1px solid ${C.dorado}66`, borderRadius: 14,
+            padding: "10px 16px", fontSize: 13, color: C.texto, boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+            maxWidth: "90vw", textAlign: "center",
+          }}>{toast}</div>
+        )}
+
+        <div style={{ position: "sticky", top: 0, zIndex: 10, background: `${C.fondo}ee`, backdropFilter: "blur(10px)", borderBottom: `1px solid ${C.borde}`, padding: "12px 16px" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", maxWidth: 460, margin: "0 auto" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <button onClick={() => setScreen("hub")} aria-label="Volver al inicio"
+                style={{ width: 44, height: 44, borderRadius: 10, background: C.card, border: `1px solid ${C.borde}`, color: C.texto, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <ChevronLeft size={19} />
+              </button>
+              <div>
+                <div className="rp-display" style={{ fontSize: 15, fontWeight: 700, lineHeight: 1 }}>Lecturas juntos</div>
+                <div style={{ fontSize: 11, color: C.sec }}>{lecturasCompartidas.length} compartidas</div>
+              </div>
+            </div>
+            <button onClick={() => setShowLecturasHistorial(true)} aria-label="Ver historial de lecturas"
+              style={{ width: 44, height: 44, borderRadius: 10, background: C.card, border: `1px solid ${C.borde}`, color: C.texto, cursor: "pointer", position: "relative", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <Eye size={17} />
+              {lecturasPendientes.length > 0 && (
+                <span style={{ position: "absolute", top: 2, right: 2, background: C.rojoBtn, color: "#fff", fontSize: 10, fontWeight: 700, borderRadius: 8, padding: "1px 5px" }}>!</span>
+              )}
+            </button>
+          </div>
+        </div>
+
+        <div style={{ maxWidth: 460, margin: "0 auto", padding: "16px" }}>
+          <button onClick={() => setShowAddLectura(true)} className="rp-display"
+            style={{ width: "100%", padding: "16px", borderRadius: 16, border: "none", cursor: "pointer", fontSize: 16, fontWeight: 700, color: "#fff", background: `linear-gradient(135deg, ${C.rojoBtn}, ${C.azulBtn})`, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, marginBottom: 16 }}>
+            <BookOpen size={18} /> Agregar lectura
+          </button>
+
+          {lecturasPendientes.length > 0 && (
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
+                <Clock size={15} color={C.dorado} />
+                <span className="rp-display" style={{ fontSize: 13, fontWeight: 700, color: C.dorado, letterSpacing: 0.5 }}>POR COMPARTIR ({lecturasPendientes.length})</span>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {lecturasPendientes.map((l) => {
+                  const imp = l.draft?.impresiones || {};
+                  const rOk = imp.ricardo?.trim(), cOk = imp.catalina?.trim();
+                  return (
+                    <div key={l.id} style={{ background: `${C.dorado}12`, border: `1px solid ${C.dorado}44`, borderRadius: 14, padding: "12px 14px" }}>
+                      <div className="rp-display" style={{ fontWeight: 700, fontSize: 15, color: C.texto, marginBottom: 2 }}>{l.titulo}</div>
+                      {(l.autor || l.contexto) && (
+                        <div style={{ color: C.sec, fontSize: 11.5, marginBottom: 8 }}>
+                          {l.autor}{l.autor && l.contexto ? " · " : ""}{l.contexto}
+                        </div>
+                      )}
+                      <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+                        {["ricardo", "catalina"].map((uk) => {
+                          const ok = uk === "ricardo" ? rOk : cOk;
+                          return (
+                            <span key={uk} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11.5, color: ok ? C.verde : C.sec }}>
+                              {ok ? <Check size={13} color={C.verde} /> : <Clock size={13} color={C.sec} />} {USERS[uk].name}
+                            </span>
+                          );
+                        })}
+                      </div>
+                      <button onClick={() => setCompartiendo(l)} className="rp-display"
+                        style={{ width: "100%", padding: "10px", borderRadius: 10, border: "none", background: `linear-gradient(135deg, ${C.verdeBtn}, ${C.azulBtn})`, color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+                        Compartir mi impresión
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {lecturasArr.length === 0 && (
+            <div style={{ textAlign: "center", padding: "40px 20px", color: C.sec }}>
+              <BookOpen size={32} color={C.borde} style={{ marginBottom: 10 }} />
+              <p style={{ margin: 0, fontSize: 13.5 }}>Aún no agregan nada. El primer discurso o escritura que lean juntos empieza acá.</p>
+            </div>
+          )}
+        </div>
+
+        {showAddLectura && (
+          <AddLecturaForm onCancel={() => setShowAddLectura(false)} onSave={agregarLectura} />
+        )}
+        {compartiendo && (
+          <CompartirLecturaForm lectura={compartiendo} currentUser={currentUser} onCancel={() => setCompartiendo(null)} onSave={(data) => guardarParteLectura(compartiendo, data)} />
+        )}
+        {showLecturasHistorial && (
+          <LecturasHistorialPanel lecturas={lecturasCompartidas} onClose={() => setShowLecturasHistorial(false)} onSelect={setLecturaDetalle} />
+        )}
+        {lecturaDetalle && (
+          <LecturaDetalle item={lecturaDetalle} onClose={() => setLecturaDetalle(null)} />
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="rp-body" style={{ minHeight: "100vh", background: `radial-gradient(circle at 70% -10%, ${C.azulD}22, ${C.fondo} 50%)`, color: C.texto, paddingBottom: 40 }}>
@@ -685,7 +953,7 @@ export default function App() {
               style={{ width: 44, height: 44, borderRadius: 10, background: C.card, border: `1px solid ${C.borde}`, color: C.texto, cursor: "pointer", position: "relative", display: "flex", alignItems: "center", justifyContent: "center" }}>
               <Eye size={17} />
               {pendientes.length > 0 ? (
-                <span style={{ position: "absolute", top: 2, right: 2, background: C.rojo, color: "#fff", fontSize: 10, fontWeight: 700, borderRadius: 8, padding: "1px 5px" }}>!</span>
+                <span style={{ position: "absolute", top: 2, right: 2, background: C.rojoBtn, color: "#fff", fontSize: 10, fontWeight: 700, borderRadius: 8, padding: "1px 5px" }}>!</span>
               ) : sala.history.length > 0 && (
                 <span style={{ position: "absolute", top: 2, right: 2, background: C.verde, color: "#052e16", fontSize: 10, fontWeight: 700, borderRadius: 8, padding: "1px 5px" }}>{sala.history.length}</span>
               )}
@@ -1124,6 +1392,82 @@ function Field({ icon, label, children }) {
 
 const inputS = { width: "100%", padding: "12px 14px", borderRadius: 12, background: C.cardHi, color: C.texto, border: `1px solid ${C.borde}`, outline: "none", fontSize: 16 }; // 16px: evita el auto-zoom de iOS al enfocar
 
+/* ============================================================
+   HistorialList — buscar / ordenar / agrupar por año / cargar de a 10
+   ------------------------------------------------------------
+   Reutilizable entre "Ya vistas" (películas) y "Ya compartidas" (lecturas).
+   Todo el filtrado/orden corre client-side sobre datos ya sincronizados
+   por Firestore — no dispara ninguna consulta nueva a la base de datos.
+   ============================================================ */
+function HistorialList({ items, getTitulo, searchFields, renderItem, placeholder, emptyText }) {
+  const [query, setQuery] = useState("");
+  const [criterio, setCriterio] = useState("reciente");
+  const [visibles, setVisibles] = useState(PAGINA);
+
+  if (items.length === 0) {
+    return <p style={{ color: C.sec, textAlign: "center", padding: "20px 0", fontSize: 13 }}>{emptyText}</p>;
+  }
+
+  const filtrados = buscarEnHistorial(items, query, searchFields);
+  const ordenados = ordenarHistorial(filtrados, criterio, getTitulo);
+  const visiblesLista = ordenados.slice(0, visibles);
+  const grupos = agruparPorAnio(visiblesLista);
+  const quedanMas = ordenados.length > visibles;
+
+  return (
+    <div>
+      {/* Buscar */}
+      <div style={{ position: "relative", marginBottom: 10 }}>
+        <input
+          value={query}
+          onChange={(e) => { setQuery(e.target.value); setVisibles(PAGINA); }}
+          placeholder={placeholder}
+          aria-label={placeholder}
+          className="rp-body"
+          style={{ ...inputS, paddingLeft: 36, fontSize: 14 }}
+        />
+        <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: C.sec, fontSize: 14 }} aria-hidden="true">🔍</span>
+      </div>
+
+      {/* Ordenar */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 14, overflowX: "auto" }} role="group" aria-label="Ordenar por">
+        {[
+          { v: "reciente", l: "Más reciente" },
+          { v: "calificacion", l: "Mejor calificada" },
+          { v: "az", l: "A-Z" },
+        ].map((op) => (
+          <button key={op.v} onClick={() => setCriterio(op.v)} className="rp-display"
+            style={{ flexShrink: 0, minHeight: 44, padding: "0 14px", display: "flex", alignItems: "center", borderRadius: 10, fontSize: 11.5, fontWeight: 600, cursor: "pointer", border: `1px solid ${criterio === op.v ? C.azul : C.borde}`, background: criterio === op.v ? `${C.azul}1F` : "transparent", color: criterio === op.v ? C.texto : C.sec }}>
+            {op.l}
+          </button>
+        ))}
+      </div>
+
+      {filtrados.length === 0 ? (
+        <p style={{ color: C.sec, textAlign: "center", padding: "16px 0", fontSize: 13 }}>Nada coincide con "{query}"</p>
+      ) : (
+        <>
+          {grupos.map(([anio, itemsDelAnio]) => (
+            <div key={anio} style={{ marginBottom: 14 }}>
+              <div className="rp-display" style={{ fontSize: 11.5, fontWeight: 700, color: C.sec, letterSpacing: 0.5, marginBottom: 8 }}>{anio}</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {itemsDelAnio.map((it) => renderItem(it))}
+              </div>
+            </div>
+          ))}
+
+          {quedanMas && (
+            <button onClick={() => setVisibles((v) => v + PAGINA)} className="rp-display"
+              style={{ width: "100%", minHeight: 44, borderRadius: 12, border: `1px dashed ${C.borde}`, background: "transparent", color: C.sec, fontWeight: 600, fontSize: 12.5, cursor: "pointer", marginTop: 4 }}>
+              Ver {Math.min(PAGINA, ordenados.length - visibles)} más
+            </button>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function HistoryPanel({ history, pendientes, onClose, onSelect, onRegistrar }) {
   return (
     <div style={overlay} onClick={onClose}>
@@ -1175,26 +1519,27 @@ function HistoryPanel({ history, pendientes, onClose, onSelect, onRegistrar }) {
           <Check size={15} color={C.verde} />
           <span className="rp-display" style={{ fontSize: 13, fontWeight: 700, color: C.verde, letterSpacing: 0.5 }}>YA VISTAS ({history.length})</span>
         </div>
-        {history.length === 0 ? (
-          <p style={{ color: C.sec, textAlign: "center", padding: "20px 0", fontSize: 13 }}>Aún ninguna registrada 🍿</p>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {history.map((h) => (
-              <button key={h.id} onClick={() => onSelect(h)}
-                style={{ textAlign: "left", background: C.cardHi, border: `1px solid ${C.borde}`, borderRadius: 14, padding: "12px 14px", cursor: "pointer", color: C.texto }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
-                  <span className="rp-display" style={{ fontWeight: 700, fontSize: 15 }}>{h.movie.title}</span>
-                  <div style={{ display: "flex", gap: 1 }}>
-                    {[1,2,3,4,5].map(n => <Star key={n} size={12} color={C.dorado} fill={n <= h.rating ? C.dorado : "none"} />)}
-                  </div>
+        <HistorialList
+          items={history}
+          getTitulo={(h) => h.movie?.title || ""}
+          searchFields={[(h) => h.movie?.title, (h) => h.lugar, (h) => h.comida]}
+          placeholder="Buscar por título, lugar o comida…"
+          emptyText="Aún ninguna registrada 🍿"
+          renderItem={(h) => (
+            <button key={h.id} onClick={() => onSelect(h)}
+              style={{ textAlign: "left", background: C.cardHi, border: `1px solid ${C.borde}`, borderRadius: 14, padding: "12px 14px", cursor: "pointer", color: C.texto }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                <span className="rp-display" style={{ fontWeight: 700, fontSize: 15 }}>{h.movie.title}</span>
+                <div style={{ display: "flex", gap: 1 }}>
+                  {[1,2,3,4,5].map(n => <Star key={n} size={12} color={C.dorado} fill={n <= h.rating ? C.dorado : "none"} />)}
                 </div>
-                <div style={{ fontSize: 12, color: C.sec, marginTop: 4, display: "flex", gap: 12, flexWrap: "wrap" }}>
-                  <span>📅 {h.fecha}</span><span>📍 {h.lugar}</span>{h.comida && <span>🍿 {h.comida}</span>}
-                </div>
-              </button>
-            ))}
-          </div>
-        )}
+              </div>
+              <div style={{ fontSize: 12, color: C.sec, marginTop: 4, display: "flex", gap: 12, flexWrap: "wrap" }}>
+                <span>📅 {h.fecha}</span><span>📍 {h.lugar}</span>{h.comida && <span>🍿 {h.comida}</span>}
+              </div>
+            </button>
+          )}
+        />
       </div>
     </div>
   );
@@ -1217,6 +1562,245 @@ function HistoryDetail({ item, onClose }) {
               <span className="rp-display" style={{ fontSize: 13, fontWeight: 600, color: u.color }}>{u.name} dijo:</span>
             </div>
             <p style={{ margin: 0, fontSize: 13.5, color: txt ? C.texto : C.sec, fontStyle: txt ? "normal" : "italic", paddingLeft: 26 }}>{txt || "— sin comentarios —"}</p>
+          </div>
+        );
+      })}
+    </Modal>
+  );
+}
+
+/* ============================================================
+   AddLecturaForm — agregar una lectura nueva
+   ------------------------------------------------------------
+   El botón "Autocompletar" llama a la Cloud Function que lee
+   título/autor/contexto del link. Es opcional y explícito (no se
+   dispara solo al pegar el link) para no sorprender con llamadas
+   de red en segundo plano — el usuario decide cuándo usarla.
+   ============================================================ */
+function AddLecturaForm({ onCancel, onSave }) {
+  const [titulo, setTitulo] = useState("");
+  const [autor, setAutor] = useState("");
+  const [enlace, setEnlace] = useState("");
+  const [contexto, setContexto] = useState("");
+  const [autocompletando, setAutocompletando] = useState(false);
+  const [shake, setShake] = useState(false);
+
+  const puedeGuardar = titulo.trim().length > 0;
+
+  const autocompletar = async () => {
+    if (!enlace.trim()) return;
+    setAutocompletando(true);
+    try {
+      const meta = await obtenerMetadatosEnlace(enlace.trim());
+      if (meta.titulo) setTitulo(meta.titulo);
+      if (meta.autor) setAutor(meta.autor);
+      if (meta.contexto) setContexto(meta.contexto);
+    } finally {
+      setAutocompletando(false);
+    }
+  };
+
+  const intentarGuardar = () => {
+    if (puedeGuardar) {
+      onSave({ titulo: titulo.trim(), autor: autor.trim(), enlace: enlace.trim(), contexto: contexto.trim() });
+    } else {
+      setShake(true);
+      vibrate(30);
+      setTimeout(() => setShake(false), 420);
+    }
+  };
+
+  return (
+    <div style={overlay}>
+      <div className="rp-slideup rp-body rp-scroll" style={{ ...sheet, maxHeight: "88vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+          <span style={{ fontSize: 11, color: C.dorado, fontWeight: 600, letterSpacing: 1, textTransform: "uppercase" }}>Nueva lectura</span>
+          <button onClick={onCancel} style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
+        </div>
+        <h2 className="rp-display" style={{ margin: "0 0 18px", fontSize: 22, fontWeight: 800, color: C.texto }}>¿Qué van a leer?</h2>
+
+        <Field icon={<Link2 size={15} />} label="Link (opcional)">
+          <div style={{ display: "flex", gap: 8 }}>
+            <input value={enlace} onChange={(e) => setEnlace(e.target.value)} placeholder="https://..." style={{ ...inputS, flex: 1 }} className="rp-body" type="url" inputMode="url" />
+            <button onClick={autocompletar} disabled={!enlace.trim() || autocompletando} className="rp-display"
+              style={{ minHeight: 44, padding: "0 14px", borderRadius: 12, border: `1px solid ${C.azul}`, background: `${C.azul}18`, color: C.texto, fontWeight: 600, fontSize: 12.5, cursor: enlace.trim() ? "pointer" : "not-allowed", opacity: enlace.trim() ? 1 : 0.5, display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap" }}>
+              <Wand2 size={14} className={autocompletando ? "rp-pulse" : ""} /> {autocompletando ? "Buscando…" : "Autocompletar"}
+            </button>
+          </div>
+          <p style={{ margin: "6px 0 0", fontSize: 11, color: C.sec }}>Funciona con YouTube, churchofjesuschrist.org, speeches.byu.edu y la mayoría de sitios — a veces no encuentra todo, se completa a mano.</p>
+        </Field>
+
+        <Field icon={<BookOpen size={15} />} label="Título">
+          <input value={titulo} onChange={(e) => setTitulo(e.target.value)} placeholder="Elige la fe en Dios que prevalece"
+            className={`rp-body${shake ? " rp-shake" : ""}`}
+            style={{ ...inputS, borderColor: shake ? C.rojo : C.borde }} />
+        </Field>
+
+        <Field icon={<User size={15} />} label="Autor (opcional)">
+          <input value={autor} onChange={(e) => setAutor(e.target.value)} placeholder="Jeffrey R. Holland" style={inputS} className="rp-body" />
+        </Field>
+
+        <Field icon={<MapPin size={15} />} label="¿Dónde se dijo? (opcional)">
+          <input value={contexto} onChange={(e) => setContexto(e.target.value)} placeholder="Conferencia General, octubre 2025" style={inputS} className="rp-body" />
+          {!contexto && <p style={{ margin: "6px 0 0", fontSize: 11, color: C.sec, fontStyle: "italic" }}>Si no lo saben todavía, no pasa nada — queda como "Aún no se sabe".</p>}
+        </Field>
+
+        <button onClick={intentarGuardar} className="rp-display"
+          style={{ width: "100%", padding: "15px", borderRadius: 14, border: "none", background: puedeGuardar ? `linear-gradient(135deg, ${C.verdeBtn}, ${C.azulBtn})` : C.cardHi, color: puedeGuardar ? "#fff" : C.sec, fontWeight: 700, fontSize: 15, cursor: "pointer", marginTop: 6, opacity: puedeGuardar ? 1 : 0.75 }}>
+          Agregar a la lista
+        </button>
+        {!puedeGuardar && <p style={{ margin: "8px 0 0", fontSize: 11.5, color: C.sec, textAlign: "center" }}>Escribe al menos el título</p>}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   CompartirLecturaForm — impresión + meta dual (mismo patrón que ViewingForm)
+   ============================================================ */
+function CompartirLecturaForm({ lectura, currentUser, onCancel, onSave }) {
+  const draft = lectura.draft || {};
+  const [fecha, setFecha] = useState(draft.fecha || new Date().toISOString().slice(0, 10));
+  const [impresion, setImpresion] = useState(draft.impresiones?.[currentUser] || "");
+  const [meta, setMeta] = useState(draft.metas?.[currentUser] || "");
+  const [shake, setShake] = useState(false);
+
+  const other = currentUser === "ricardo" ? "catalina" : "ricardo";
+  const otherUser = USERS[other];
+  const otherImpresion = draft.impresiones?.[other] || "";
+  const otherListo = otherImpresion.trim().length > 0;
+  const puedeGuardar = impresion.trim().length > 0;
+
+  const intentarGuardar = () => {
+    if (puedeGuardar) {
+      onSave({ fecha, impresion, meta });
+    } else {
+      setShake(true);
+      vibrate(30);
+      setTimeout(() => setShake(false), 420);
+    }
+  };
+
+  return (
+    <div style={overlay}>
+      <div className="rp-slideup rp-body rp-scroll" style={{ ...sheet, maxHeight: "88vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+          <span style={{ fontSize: 11, color: C.dorado, fontWeight: 600, letterSpacing: 1, textTransform: "uppercase" }}>Compartir impresión</span>
+          <button onClick={onCancel} style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
+        </div>
+        <h2 className="rp-display" style={{ margin: "0 0 4px", fontSize: 20, fontWeight: 800, color: C.texto }}>{lectura.titulo}</h2>
+        {(lectura.autor || lectura.contexto) && (
+          <p style={{ margin: "0 0 18px", fontSize: 12, color: C.sec }}>{lectura.autor}{lectura.autor && lectura.contexto ? " · " : ""}{lectura.contexto}</p>
+        )}
+
+        {otherListo && (
+          <div style={{ background: `${C.verde}14`, border: `1px solid ${C.verde}44`, borderRadius: 12, padding: "10px 12px", marginBottom: 16, fontSize: 12.5, color: C.texto, display: "flex", alignItems: "center", gap: 8 }}>
+            <Check size={15} color={C.verde} /> {otherUser.name} ya compartió su parte. ¡Falta la tuya!
+          </div>
+        )}
+
+        <Field icon={<Calendar size={15} />} label="Fecha">
+          <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} style={inputS} className="rp-body" />
+        </Field>
+
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+            <div style={{ width: 22, height: 22, borderRadius: "50%", background: USERS[currentUser].color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "#fff" }} className="rp-display">{USERS[currentUser].initial}</div>
+            <span className="rp-display" style={{ fontSize: 13, fontWeight: 600, color: USERS[currentUser].color }}>¿Qué sentiste? <span style={{ color: C.rojo }}>*</span></span>
+          </div>
+          <textarea value={impresion} onChange={(e) => setImpresion(e.target.value)} placeholder="Lo que te hizo sentir o pensar…" rows={2}
+            className={`rp-body${shake ? " rp-shake" : ""}`}
+            style={{ ...inputS, resize: "vertical", borderColor: shake ? C.rojo : USERS[currentUser].color + "66" }} />
+        </div>
+
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4, color: C.sec, fontSize: 12, fontWeight: 600 }}>
+            <Heart size={13} /> ¿Alguna meta o deseo que les dejó? (opcional)
+          </div>
+          <textarea value={meta} onChange={(e) => setMeta(e.target.value)} placeholder="Algo que quieran aplicar o intentar…" rows={2} style={{ ...inputS, resize: "vertical" }} className="rp-body" />
+        </div>
+
+        {otherListo && (
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+              <div style={{ width: 22, height: 22, borderRadius: "50%", background: otherUser.color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "#fff" }} className="rp-display">{otherUser.initial}</div>
+              <span className="rp-display" style={{ fontSize: 13, fontWeight: 600, color: otherUser.color }}>{otherUser.name} sintió:</span>
+            </div>
+            <div style={{ ...inputS, minHeight: 44, opacity: 0.7 }}>{otherImpresion}</div>
+          </div>
+        )}
+
+        <button onClick={intentarGuardar} className="rp-display"
+          style={{ width: "100%", padding: "15px", borderRadius: 14, border: "none", background: puedeGuardar ? `linear-gradient(135deg, ${C.verdeBtn}, ${C.azulBtn})` : C.cardHi, color: puedeGuardar ? "#fff" : C.sec, fontWeight: 700, fontSize: 15, cursor: "pointer", marginTop: 6, opacity: puedeGuardar ? 1 : 0.75 }}>
+          {otherListo ? "Guardar y completar" : "Guardar mi parte"}
+        </button>
+        {!puedeGuardar && <p style={{ margin: "8px 0 0", fontSize: 11.5, color: C.sec, textAlign: "center" }}>Escribe algo en "¿Qué sentiste?" para guardar</p>}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   LecturasHistorialPanel — usa el mismo HistorialList que películas
+   ============================================================ */
+function LecturasHistorialPanel({ lecturas, onClose, onSelect }) {
+  return (
+    <div style={overlay} onClick={onClose}>
+      <div className="rp-slideup rp-body rp-scroll" style={{ ...sheet, maxHeight: "85vh", overflowY: "auto" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <h2 className="rp-display" style={{ margin: 0, fontSize: 20, fontWeight: 800, color: C.texto }}>📖 Ya compartidas</h2>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
+        </div>
+        <HistorialList
+          items={lecturas}
+          getTitulo={(l) => l.titulo || ""}
+          searchFields={[(l) => l.titulo, (l) => l.autor, (l) => l.contexto]}
+          placeholder="Buscar por título, autor o contexto…"
+          emptyText="Aún ninguna compartida"
+          renderItem={(l) => (
+            <button key={l.id} onClick={() => onSelect(l)}
+              style={{ textAlign: "left", background: C.cardHi, border: `1px solid ${C.borde}`, borderRadius: 14, padding: "12px 14px", cursor: "pointer", color: C.texto }}>
+              <div className="rp-display" style={{ fontWeight: 700, fontSize: 15 }}>{l.titulo}</div>
+              <div style={{ fontSize: 12, color: C.sec, marginTop: 4, display: "flex", gap: 12, flexWrap: "wrap" }}>
+                {l.autor && <span>✍️ {l.autor}</span>}
+                <span>📅 {l.fecha}</span>
+                {l.contexto && <span>📍 {l.contexto}</span>}
+              </div>
+            </button>
+          )}
+        />
+      </div>
+    </div>
+  );
+}
+
+function LecturaDetalle({ item, onClose }) {
+  return (
+    <Modal title={item.titulo} onClose={onClose}>
+      <div style={{ display: "flex", gap: 12, marginBottom: 14, flexWrap: "wrap", fontSize: 13, color: C.sec }}>
+        {item.autor && <span>✍️ {item.autor}</span>}
+        <span>📅 {item.fecha}</span>
+        {item.contexto && <span>📍 {item.contexto}</span>}
+      </div>
+      {item.enlace && (
+        <a href={item.enlace} target="_blank" rel="noopener noreferrer" style={{ display: "inline-flex", alignItems: "center", gap: 6, color: C.azul, fontSize: 12.5, marginBottom: 16, textDecoration: "none" }}>
+          <Link2 size={13} /> Ver el enlace original
+        </a>
+      )}
+      {["ricardo", "catalina"].map((uk) => {
+        const u = USERS[uk], txt = item.impresiones?.[uk], metaTxt = item.metas?.[uk];
+        return (
+          <div key={uk} style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+              <div style={{ width: 20, height: 20, borderRadius: "50%", background: u.color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff" }} className="rp-display">{u.initial}</div>
+              <span className="rp-display" style={{ fontSize: 13, fontWeight: 600, color: u.color }}>{u.name} sintió:</span>
+            </div>
+            <p style={{ margin: "0 0 6px", fontSize: 13.5, color: txt ? C.texto : C.sec, fontStyle: txt ? "normal" : "italic", paddingLeft: 26 }}>{txt || "— sin comentarios —"}</p>
+            {metaTxt && (
+              <p style={{ margin: 0, fontSize: 12.5, color: C.sec, paddingLeft: 26, display: "flex", alignItems: "flex-start", gap: 5 }}>
+                <Heart size={12} style={{ marginTop: 2, flexShrink: 0 }} /> {metaTxt}
+              </p>
+            )}
           </div>
         );
       })}

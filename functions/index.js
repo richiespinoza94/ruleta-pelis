@@ -13,6 +13,7 @@
    ============================================================ */
 
 const { onDocumentWritten } = require("firebase-functions/v2/firestore");
+const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { initializeApp } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const { getMessaging } = require("firebase-admin/messaging");
@@ -84,7 +85,7 @@ async function enviarA(usuario, { titulo, cuerpo, tag, renotify }) {
 }
 
 exports.notificarCambios = onDocumentWritten(
-  { document: "sala/casa", region: "us-central1" },
+  { document: "sala/casa", region: "southamerica-east1" }, // debe coincidir con la región real de Firestore
   async (event) => {
     const antes = event.data.before.exists ? event.data.before.data() : null;
     const despues = event.data.after.exists ? event.data.after.data() : null;
@@ -137,3 +138,130 @@ exports.notificarCambios = onDocumentWritten(
     }
   }
 );
+
+/* ============================================================
+   obtenerMetadatosEnlace — autocompletar título/autor/contexto
+   ------------------------------------------------------------
+   Recibe un link (discurso, artículo, video) y trata de sacar:
+   - título   → etiqueta <meta property="og:title"> de la página
+   - autor    → inferido del propio slug de la URL cuando se puede
+                (ej. BYU Speeches), vacío si no hay forma confiable
+   - contexto → inferido de patrones de URL conocidos del entorno
+                SUD (Conferencia General, FTSOY, Ven Sígueme, etc.)
+
+   Es "mejor esfuerzo": si algo no se puede inferir, se devuelve
+   vacío — la persona siempre puede completarlo a mano en el form.
+   No hace falta un scraper distinto por sitio: una sola función
+   genérica + un puñado de patrones de URL alcanza para todo esto.
+   ============================================================ */
+const MESES = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
+
+function inferirContextoLDS(url) {
+  const u = url.toLowerCase();
+  let m;
+  if ((m = u.match(/\/general-conference\/(\d{4})\/(\d{2})\//))) {
+    return `Conferencia General, ${MESES[parseInt(m[2], 10)] || m[2]} ${m[1]}`;
+  }
+  if ((m = u.match(/\/ftsoy\/(\d{4})\/(\d{2})\//))) {
+    return `Para la Fortaleza de la Juventud, ${MESES[parseInt(m[2], 10)] || m[2]} ${m[1]}`;
+  }
+  if (/\/come-follow-me\/|\/venid-y-seguidme\/|\/ven-sigueme\//.test(u)) return "Ven, Sígueme";
+  if (/worldwide-devotional|devocional-mundial/.test(u)) return "Devocional Mundial";
+  if (/speeches\.byu\.edu/.test(u)) return "BYU Speeches";
+  return "";
+}
+
+function inferirAutorDesdeSlugBYU(url) {
+  const m = url.match(/speeches\.byu\.edu\/talks\/([a-z0-9-]+)\//i);
+  if (!m) return "";
+  return m[1]
+    .split("-")
+    .map((p) => {
+      const cap = p.charAt(0).toUpperCase() + p.slice(1);
+      return p.length === 1 ? cap + "." : cap;
+    })
+    .join(" ");
+}
+
+function esYouTube(url) {
+  return /youtube\.com\/watch|youtu\.be\//.test(url);
+}
+
+async function obtenerMetadatosYouTube(url) {
+  // Endpoint público de YouTube (oEmbed) — no requiere API key.
+  const resp = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`);
+  if (!resp.ok) return { titulo: "", autor: "", contexto: "" };
+  const data = await resp.json();
+  return { titulo: data.title || "", autor: data.author_name || "", contexto: "" };
+}
+
+function extraerOgTitle(html) {
+  const m =
+    html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i) ||
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i);
+  if (m) return decodeEntidadesHtml(m[1]);
+  const t = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+  return t ? decodeEntidadesHtml(t[1]).replace(/\s*[|\-–]\s*.*$/, "").trim() : "";
+}
+
+function decodeEntidadesHtml(s) {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&aacute;/g, "á").replace(/&eacute;/g, "é").replace(/&iacute;/g, "í")
+    .replace(/&oacute;/g, "ó").replace(/&uacute;/g, "ú").replace(/&ntilde;/g, "ñ");
+}
+
+exports.obtenerMetadatosEnlace = onCall({ region: "us-central1", timeoutSeconds: 15 }, async (request) => {
+  const url = (request.data && request.data.url || "").trim();
+  if (!url || !/^https?:\/\//i.test(url)) {
+    throw new HttpsError("invalid-argument", "Manda un link válido (http:// o https://)");
+  }
+
+  if (esYouTube(url)) {
+    try {
+      return await obtenerMetadatosYouTube(url);
+    } catch (e) {
+      console.warn("Fallo oEmbed de YouTube:", e);
+      return { titulo: "", autor: "", contexto: "" };
+    }
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const resp = await fetch(url, {
+      signal: controller.signal,
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; RuletaPelisBot/1.0)" },
+    });
+    clearTimeout(timer);
+
+    if (!resp.ok) return { titulo: "", autor: "", contexto: inferirContextoLDS(url) };
+
+    // Solo leemos los primeros ~60KB — el <title>/<meta og:title> siempre está
+    // en el <head>, no hace falta descargar la página entera.
+    const reader = resp.body.getReader();
+    let html = "";
+    let leido = 0;
+    while (leido < 60000) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      html += Buffer.from(value).toString("utf8");
+      leido += value.length;
+    }
+    reader.cancel().catch(() => {});
+
+    return {
+      titulo: extraerOgTitle(html),
+      autor: inferirAutorDesdeSlugBYU(url),
+      contexto: inferirContextoLDS(url),
+    };
+  } catch (e) {
+    console.warn("No se pudieron leer metadatos de", url, e.message);
+    // Aunque falle la lectura de la página, el contexto por patrón de URL
+    // igual puede servir — lo devolvemos aunque el resto quede vacío.
+    return { titulo: "", autor: "", contexto: inferirContextoLDS(url) };
+  }
+});
+

@@ -1,6 +1,7 @@
 import { initializeApp } from "firebase/app";
 import { getFirestore } from "firebase/firestore";
 import { getMessaging, isSupported } from "firebase/messaging";
+import { getFunctions, httpsCallable } from "firebase/functions";
 
 const firebaseConfig = {
   apiKey: "AIzaSyA8gYVgbT6V6qFZUVGwkgooUUoKg-3cxvc",
@@ -13,12 +14,9 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app);
+const functions = getFunctions(app);
 
-/* ------------------------------------------------------------------
-   Clave VAPID — la sacas de Firebase Console:
-   Configuración del proyecto → Cloud Messaging → "Certificados push web"
-   → Generar par de claves → copiar la clave pública y pegarla aquí.
-   ------------------------------------------------------------------ */
+/* Clave VAPID ya configurada (Firebase Console → Cloud Messaging → Certificados push web) */
 export const VAPID_KEY = "BGdBXhVWJXQaW-Si--9x8XgxA4g_r4ajsLz2-jzqS8q7ap5n_x1MzMEY-g6hp2X1rD7UaDX3LzbMfT12JKpg9nI";
 
 /* getMessaging() truena en navegadores sin soporte (algunos iOS, modo incógnito),
@@ -31,5 +29,18 @@ export async function getMessagingSeguro() {
   } catch (e) {
     console.warn("Cloud Messaging no disponible en este navegador:", e);
     return null;
+  }
+}
+
+/* Llama a la Cloud Function que autocompleta título/autor/contexto desde un link.
+   Devuelve {titulo, autor, contexto} — cualquiera puede venir vacío si no se pudo inferir. */
+export async function obtenerMetadatosEnlace(url) {
+  try {
+    const fn = httpsCallable(functions, "obtenerMetadatosEnlace");
+    const res = await fn({ url });
+    return res.data;
+  } catch (e) {
+    console.warn("No se pudieron obtener metadatos del enlace:", e);
+    return { titulo: "", autor: "", contexto: "" };
   }
 }

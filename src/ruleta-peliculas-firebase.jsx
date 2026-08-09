@@ -30,9 +30,19 @@ const C = {
 };
 
 const USERS = {
-  ricardo: { name: "Ricardo", pin: "9456", color: C.azul, initial: "R" },
-  catalina: { name: "Catalina", pin: "1511", color: C.rojo, initial: "C" },
+  ricardo: { name: "Ricardo", pin: "9456", color: C.azul, btn: C.azulBtn, initial: "R" },
+  catalina: { name: "Catalina", pin: "1511", color: C.rojo, btn: C.rojoBtn, initial: "C" },
 };
+
+const ANNIVERSARY_DATE = "29 de julio de 2026";
+
+/* Mensajes de error del PIN — cálidos pero genéricos (sirven para cualquiera
+   de los dos, ya que cualquiera puede equivocarse escribiendo). */
+const PIN_ERROR_MESSAGES = [
+  "Casi… intenta otra vez, mi amor",
+  "Ese no es, pero te quiero igual",
+  "Un dígito se perdió en el camino",
+];
 
 const ESTADOS = [
   { label: "Con sueño", emoji: "😴" },
@@ -302,6 +312,10 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [pin, setPin] = useState("");
   const [pinError, setPinError] = useState(false);
+  const [loginStep, setLoginStep] = useState("select"); // "select" | "pin" | "success"
+  const [loginPerson, setLoginPerson] = useState(null); // persona elegida, aún sin verificar
+  const [pinErrorMsg, setPinErrorMsg] = useState("");
+  const [loginShake, setLoginShake] = useState(false);
 
   const [sala, setSala] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -326,8 +340,8 @@ export default function App() {
   const [pushOcupado, setPushOcupado] = useState(false);
 
   const spinRef = useRef(false);           // ✅ ahora arriba, siempre se ejecuta
-  const pinBoxRefs = useRef([]);            // #1 casillas de PIN
   const prevOtherEstado = useRef(null);     // #2 detectar cambio de estado remoto
+  const loginSuccessTimeoutRef = useRef(null); // permite cancelar el auto-avance si tocan para saltarlo
   const notifiedReqRef = useRef(null);      // #4 evitar notificar 2 veces la misma solicitud
   const SALA_DOC = doc(db, "sala", "casa");
 
@@ -569,88 +583,146 @@ export default function App() {
     );
   }
 
+  const seleccionarPersona = (key) => {
+    vibrate(12);
+    setLoginPerson(key);
+    setLoginStep("pin");
+    setPin("");
+    setPinError(false);
+  };
+
+  const volverASeleccion = () => {
+    setLoginStep("select");
+    setLoginPerson(null);
+    setPin("");
+    setPinError(false);
+  };
+
+  const terminarLogin = () => {
+    if (loginSuccessTimeoutRef.current) clearTimeout(loginSuccessTimeoutRef.current);
+    setCurrentUser(loginPerson);
+    setScreen("hub");
+    setLoginStep("select");
+    setLoginPerson(null);
+    setPin("");
+    setPinError(false);
+  };
+
   const tryLogin = (candidatePin) => {
     const pinToCheck = candidatePin !== undefined ? candidatePin : pin;
-    const match = Object.keys(USERS).find((k) => USERS[k].pin === pinToCheck);
-    if (match) {
+    if (pinToCheck === USERS[loginPerson].pin) {
       vibrate(20); // #1 haptic de éxito
-      setCurrentUser(match);
-      setScreen("hub");
-      setPin("");
-      setPinError(false);
+      setLoginStep("success");
+      // Auto-avanza rápido (sin exigir un toque extra) — pensado para entrar
+      // varias veces al día; si tocan la pantalla antes, terminarLogin() cancela esto.
+      loginSuccessTimeoutRef.current = setTimeout(terminarLogin, 900);
     } else {
       vibrate([15, 40, 15, 40, 15]); // #1 haptic de error (patrón distinto al de éxito)
+      setPinErrorMsg(PIN_ERROR_MESSAGES[Math.floor(Math.random() * PIN_ERROR_MESSAGES.length)]);
       setPinError(true);
-      setTimeout(() => setPinError(false), 600);
-      setPin("");
-      pinBoxRefs.current[0]?.focus();
+      setLoginShake(true);
+      setTimeout(() => { setPin(""); setLoginShake(false); }, 550);
     }
   };
 
+  const pressDigit = (d) => {
+    if (pin.length >= 4) return;
+    const next = pin + d;
+    setPin(next);
+    setPinError(false); // limpia el error al empezar a escribir de nuevo (como en el mockup)
+    if (next.length === 4) {
+      setTimeout(() => tryLogin(next), 200); // pausa breve para que se vea el último punto lleno
+    }
+  };
+  const pressDelete = () => setPin((p) => p.slice(0, -1));
+
   if (screen === "login") {
+    const personaActual = loginPerson ? USERS[loginPerson] : null;
+    const keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "", "0", "del"];
+
     return (
       <div className="rp-body" style={{ minHeight: "100vh", background: `radial-gradient(circle at 30% 20%, ${C.azulD}22, ${C.fondo} 55%)`, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
         <FontStyles />
-        <div className="rp-pop" style={{ background: C.card, border: `1px solid ${C.borde}`, borderRadius: 24, padding: "40px 28px", width: "100%", maxWidth: 380, textAlign: "center" }}>
-          <div style={{ display: "inline-flex", gap: 6, marginBottom: 16 }}>
-            {[C.verde, C.rojo, C.azul].map((c, i) => (
-              <div key={i} style={{ width: 12, height: 12, borderRadius: "50%", background: c }} />
-            ))}
-          </div>
-          <div style={{ display: "flex", justifyContent: "center", gap: 8, marginBottom: 10 }}>
-            <div style={{ width: 40, height: 40, borderRadius: 12, background: `${C.verde}1F`, border: `1px solid ${C.verde}44`, display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <Film size={18} color={C.verde} />
-            </div>
-            <div style={{ width: 40, height: 40, borderRadius: 12, background: `${C.rojo}1F`, border: `1px solid ${C.rojo}44`, display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <BookOpen size={18} color={C.rojo} />
-            </div>
-          </div>
-          <h1 className="rp-display" style={{ color: C.texto, fontSize: 26, fontWeight: 800, margin: "0 0 4px" }}>Ricardo & Catalina</h1>
-          <p style={{ color: C.sec, fontSize: 13, margin: "0 0 28px" }}>Su espacio compartido</p>
+        <div className="rp-pop" style={{ position: "relative", overflow: "hidden", background: C.card, border: `1px solid ${C.borde}`, borderRadius: 24, padding: "36px 26px", width: "100%", maxWidth: 380, minHeight: 420, display: "flex", flexDirection: "column" }}>
 
-          <div style={{ marginBottom: 8 }}>
-            <div style={{ display: "flex", gap: 10, justifyContent: "center" }} role="group" aria-label="Ingresa tu PIN de 4 dígitos">
-              {[0, 1, 2, 3].map((i) => (
-                <input
-                  key={i}
-                  ref={(el) => (pinBoxRefs.current[i] = el)}
-                  type="password" inputMode="numeric" maxLength={1}
-                  autoComplete="one-time-code"
-                  aria-label={`Dígito ${i + 1} del PIN`}
-                  value={pin[i] || ""}
-                  onChange={(e) => {
-                    const digit = e.target.value.replace(/\D/g, "").slice(-1);
-                    const next = (pin.slice(0, i) + digit + pin.slice(i + 1)).slice(0, 4);
-                    setPin(next);
-                    if (digit && i < 3) pinBoxRefs.current[i + 1]?.focus();
-                    if (digit && i === 3 && next.length === 4) {
-                      setTimeout(() => tryLogin(next), 120);
-                    }
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Backspace" && !pin[i] && i > 0) pinBoxRefs.current[i - 1]?.focus();
-                    if (e.key === "Enter") tryLogin();
-                  }}
-                  className="rp-body"
-                  style={{
-                    width: 52, height: 60, borderRadius: 14, fontSize: 24, textAlign: "center",
-                    background: C.cardHi, color: C.texto,
-                    border: `2px solid ${pinError ? C.rojo : (pin[i] ? C.dorado : C.borde)}`,
-                    outline: "none", transition: "border 0.2s",
-                  }}
-                />
-              ))}
-            </div>
-          </div>
-          {pinError && <p style={{ color: C.rojo, fontSize: 12, margin: "0 0 8px" }} role="alert">PIN incorrecto</p>}
+          {/* ---------- Paso 1: elegir persona ---------- */}
+          {loginStep === "select" && (
+            <div className="rp-slideup" style={{ display: "flex", flexDirection: "column", flex: 1 }}>
+              <div style={{ display: "inline-flex", alignItems: "center", gap: 8, alignSelf: "center", padding: "6px 14px", borderRadius: 999, background: `${C.dorado}1F`, border: `1px solid ${C.dorado}55`, marginBottom: 24 }}>
+                <span style={{ fontSize: 14 }} aria-hidden="true">💛</span>
+                <span className="rp-body" style={{ color: C.texto, fontSize: 12.5 }}>Nuestra fecha: {ANNIVERSARY_DATE}</span>
+              </div>
+              <h1 className="rp-display" style={{ color: C.texto, fontSize: 24, fontWeight: 800, margin: "0 0 6px", textAlign: "center" }}>¿Quién eres?</h1>
+              <p style={{ color: C.sec, fontSize: 13.5, textAlign: "center", margin: "0 0 24px" }}>Elige tu nombre para entrar a su espacio</p>
 
-          <button
-            onClick={tryLogin}
-            className="rp-display"
-            style={{ width: "100%", padding: "15px", borderRadius: 14, border: "none", cursor: "pointer", fontSize: 16, fontWeight: 700, color: "#fff", background: `linear-gradient(135deg, ${C.verdeBtn}, ${C.azulBtn})` }}
-          >
-            Entrar
-          </button>
+              <div style={{ display: "flex", gap: 12, flex: 1 }}>
+                {["ricardo", "catalina"].map((key) => {
+                  const u = USERS[key];
+                  return (
+                    <button key={key} onClick={() => seleccionarPersona(key)}
+                      aria-label={`Entrar como ${u.name}`}
+                      style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, padding: "22px 8px", borderRadius: 18, background: C.cardHi, border: `1px solid ${C.borde}`, cursor: "pointer", minHeight: 140 }}>
+                      <div style={{ width: 60, height: 60, borderRadius: "50%", background: u.btn, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontFamily: "Outfit, sans-serif", fontWeight: 700, fontSize: 24, boxShadow: `0 10px 24px ${u.color}55` }}>{u.initial}</div>
+                      <span className="rp-display" style={{ color: C.texto, fontWeight: 600, fontSize: 15 }}>{u.name}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* ---------- Paso 2: PIN con teclado numérico ---------- */}
+          {loginStep === "pin" && personaActual && (
+            <div className="rp-slideup" style={{ display: "flex", flexDirection: "column", flex: 1 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
+                <button onClick={volverASeleccion} aria-label="Volver"
+                  style={{ width: 44, height: 44, borderRadius: "50%", background: C.cardHi, border: `1px solid ${C.borde}`, color: C.texto, fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <ChevronLeft size={19} />
+                </button>
+                <div style={{ width: 36, height: 36, borderRadius: "50%", background: personaActual.btn, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontFamily: "Outfit, sans-serif", fontWeight: 700, fontSize: 14 }}>{personaActual.initial}</div>
+                <span className="rp-display" style={{ color: C.texto, fontWeight: 600, fontSize: 16 }}>Hola, {personaActual.name}</span>
+              </div>
+
+              <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 18 }}>
+                <p style={{ color: C.sec, fontSize: 13, margin: 0 }}>Ingresa tu PIN</p>
+                <div className={loginShake ? "rp-shake" : ""} style={{ display: "flex", gap: 16 }} role="group" aria-label={`${pin.length} de 4 dígitos ingresados`}>
+                  {[0, 1, 2, 3].map((i) => (
+                    <div key={i} aria-hidden="true" style={{
+                      width: 16, height: 16, borderRadius: "50%",
+                      background: i < pin.length ? personaActual.color : "transparent",
+                      border: `2px solid ${i < pin.length ? personaActual.color : C.sec}`,
+                    }} />
+                  ))}
+                </div>
+                {pinError && <p style={{ color: C.rojo, fontSize: 12.5, textAlign: "center", maxWidth: 220, margin: 0 }} role="alert">{pinErrorMsg}</p>}
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12 }} role="group" aria-label="Teclado numérico">
+                {keys.map((k, idx) =>
+                  k === "" ? (
+                    <div key={idx} aria-hidden="true" />
+                  ) : (
+                    <button key={idx}
+                      onClick={() => (k === "del" ? pressDelete() : pressDigit(k))}
+                      aria-label={k === "del" ? "Borrar" : `Dígito ${k}`}
+                      className="rp-display"
+                      style={{ height: 56, borderRadius: 16, background: C.cardHi, border: `1px solid ${C.borde}`, color: C.texto, fontWeight: 600, fontSize: 19, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      {k === "del" ? "⌫" : k}
+                    </button>
+                  )
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ---------- Paso 3: bienvenida (auto-avanza, o toca para no esperar) ---------- */}
+          {loginStep === "success" && personaActual && (
+            <div onClick={terminarLogin} className="rp-pop" style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, cursor: "pointer" }}>
+              <div className="rp-pulse" style={{ width: 88, height: 88, borderRadius: "50%", background: `radial-gradient(circle, ${personaActual.color}55, ${C.dorado}55)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 36 }} aria-hidden="true">💛</div>
+              <h2 className="rp-display" style={{ color: C.texto, fontSize: 22, fontWeight: 800, margin: 0, textAlign: "center" }}>Bienvenido/a, {personaActual.name}</h2>
+              <p style={{ color: C.sec, fontSize: 13, textAlign: "center", lineHeight: 1.6, margin: 0, maxWidth: 250 }}>Que este espacio siga creciendo con cada recuerdo que suman juntos.</p>
+            </div>
+          )}
         </div>
       </div>
     );

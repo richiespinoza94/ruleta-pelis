@@ -597,9 +597,16 @@ export default function App() {
               <div key={i} style={{ width: 12, height: 12, borderRadius: "50%", background: c }} />
             ))}
           </div>
-          <div style={{ fontSize: 46, marginBottom: 4 }}>🎬</div>
-          <h1 className="rp-display" style={{ color: C.texto, fontSize: 26, fontWeight: 800, margin: "0 0 4px" }}>Ruleta de Pelis</h1>
-          <p style={{ color: C.sec, fontSize: 13, margin: "0 0 28px" }}>Ricardo & Catalina · noche de cine</p>
+          <div style={{ display: "flex", justifyContent: "center", gap: 8, marginBottom: 10 }}>
+            <div style={{ width: 40, height: 40, borderRadius: 12, background: `${C.verde}1F`, border: `1px solid ${C.verde}44`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <Film size={18} color={C.verde} />
+            </div>
+            <div style={{ width: 40, height: 40, borderRadius: 12, background: `${C.rojo}1F`, border: `1px solid ${C.rojo}44`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <BookOpen size={18} color={C.rojo} />
+            </div>
+          </div>
+          <h1 className="rp-display" style={{ color: C.texto, fontSize: 26, fontWeight: 800, margin: "0 0 4px" }}>Ricardo & Catalina</h1>
+          <p style={{ color: C.sec, fontSize: 13, margin: "0 0 28px" }}>Su espacio compartido</p>
 
           <div style={{ marginBottom: 8 }}>
             <div style={{ display: "flex", gap: 10, justifyContent: "center" }} role="group" aria-label="Ingresa tu PIN de 4 dígitos">
@@ -939,16 +946,18 @@ export default function App() {
         </div>
       )}
 
-      <div style={{ position: "sticky", top: 0, zIndex: 10, background: `${C.fondo}ee`, backdropFilter: "blur(10px)", borderBottom: `1px solid ${C.borde}`, padding: "12px 16px" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", maxWidth: 460, margin: "0 auto" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div style={{ width: 36, height: 36, borderRadius: "50%", background: me.color, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, color: "#fff" }} className="rp-display">{me.initial}</div>
-            <div>
-              <div className="rp-display" style={{ fontSize: 15, fontWeight: 700, lineHeight: 1 }}>Hola, {me.name}</div>
-              <div style={{ fontSize: 11, color: C.sec }}>{available.length} pelis en la ruleta</div>
+        <div style={{ position: "sticky", top: 0, zIndex: 10, background: `${C.fondo}ee`, backdropFilter: "blur(10px)", borderBottom: `1px solid ${C.borde}`, padding: "12px 16px" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", maxWidth: 460, margin: "0 auto" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <button onClick={() => setScreen("hub")} aria-label="Volver al inicio"
+                style={{ width: 44, height: 44, borderRadius: 10, background: C.card, border: `1px solid ${C.borde}`, color: C.texto, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <ChevronLeft size={19} />
+              </button>
+              <div>
+                <div className="rp-display" style={{ fontSize: 15, fontWeight: 700, lineHeight: 1 }}>Ruleta de pelis</div>
+                <div style={{ fontSize: 11, color: C.sec }}>{available.length} pelis en la ruleta</div>
+              </div>
             </div>
-          </div>
-          <div style={{ display: "flex", gap: 6 }}>
             <button onClick={() => setShowHistory(true)} title="Historial" aria-label="Ver historial de películas"
               style={{ width: 44, height: 44, borderRadius: 10, background: C.card, border: `1px solid ${C.borde}`, color: C.texto, cursor: "pointer", position: "relative", display: "flex", alignItems: "center", justifyContent: "center" }}>
               <Eye size={17} />
@@ -958,13 +967,8 @@ export default function App() {
                 <span style={{ position: "absolute", top: 2, right: 2, background: C.verde, color: "#052e16", fontSize: 10, fontWeight: 700, borderRadius: 8, padding: "1px 5px" }}>{sala.history.length}</span>
               )}
             </button>
-            <button onClick={() => { setScreen("login"); setCurrentUser(null); }} title="Salir" aria-label="Cerrar sesión"
-              style={{ width: 44, height: 44, borderRadius: 10, background: C.card, border: `1px solid ${C.borde}`, color: C.sec, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <X size={17} />
-            </button>
           </div>
         </div>
-      </div>
 
       <div style={{ maxWidth: 460, margin: "0 auto", padding: "16px" }}>
 

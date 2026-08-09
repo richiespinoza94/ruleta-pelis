@@ -164,6 +164,10 @@ const FontStyles = () => (
       40%, 60% { transform: translateX(4px); }
     }
     .rp-shake { animation: rp-shake 0.4s ease; }
+    /* Fix: 100vh no coincide con el alto real visible en celular (la barra de
+       direcciones lo distorsiona) — svh sí. Se declara dos veces a propósito:
+       la 2da línea la ignoran los navegadores viejos, la usan los nuevos. */
+    .rp-safe-height { min-height: 100vh; min-height: 100svh; }
     .rp-confetti-piece { animation-name: rp-confetti-fall; animation-timing-function: ease-in; animation-fill-mode: forwards; border-radius: 2px; }
     /* #8 Accesibilidad: respeta la preferencia de movimiento reducido del sistema
        (solo afecta animaciones decorativas, no la rotación funcional de la ruleta,
@@ -564,7 +568,7 @@ export default function App() {
 
   if (loading) {
     return (
-      <div className="rp-body" style={{ minHeight: "100vh", background: C.fondo, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div className="rp-body rp-safe-height" style={{ background: C.fondo, display: "flex", alignItems: "center", justifyContent: "center" }}>
         <FontStyles />
         <div style={{ textAlign: "center" }}>
           <div className="rp-pulse" style={{ fontSize: 48, marginBottom: 12 }}>🎬</div>
@@ -576,7 +580,7 @@ export default function App() {
 
   if (!sala) {
     return (
-      <div className="rp-body" style={{ minHeight: "100vh", background: C.fondo, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div className="rp-body rp-safe-height" style={{ background: C.fondo, display: "flex", alignItems: "center", justifyContent: "center" }}>
         <FontStyles />
         <p style={{ color: C.rojo }}>Error al conectar a Firestore. Verifica tu config.</p>
       </div>
@@ -613,9 +617,9 @@ export default function App() {
     if (pinToCheck === USERS[loginPerson].pin) {
       vibrate(20); // #1 haptic de éxito
       setLoginStep("success");
-      // Auto-avanza rápido (sin exigir un toque extra) — pensado para entrar
-      // varias veces al día; si tocan la pantalla antes, terminarLogin() cancela esto.
-      loginSuccessTimeoutRef.current = setTimeout(terminarLogin, 900);
+      // Auto-avanza en 3s (suficiente para leer el mensaje sin sentirse forzado) —
+      // si tocan la pantalla o el botón "Continuar" antes, terminarLogin() cancela esto.
+      loginSuccessTimeoutRef.current = setTimeout(terminarLogin, 3000);
     } else {
       vibrate([15, 40, 15, 40, 15]); // #1 haptic de error (patrón distinto al de éxito)
       setPinErrorMsg(PIN_ERROR_MESSAGES[Math.floor(Math.random() * PIN_ERROR_MESSAGES.length)]);
@@ -641,9 +645,9 @@ export default function App() {
     const keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "", "0", "del"];
 
     return (
-      <div className="rp-body" style={{ minHeight: "100vh", background: `radial-gradient(circle at 30% 20%, ${C.azulD}22, ${C.fondo} 55%)`, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div className="rp-body rp-safe-height" style={{ background: `radial-gradient(circle at 30% 20%, ${C.azulD}22, ${C.fondo} 55%)`, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
         <FontStyles />
-        <div className="rp-pop" style={{ position: "relative", overflow: "hidden", background: C.card, border: `1px solid ${C.borde}`, borderRadius: 24, padding: "36px 26px", width: "100%", maxWidth: 380, minHeight: 420, display: "flex", flexDirection: "column" }}>
+        <div className="rp-pop rp-scroll" style={{ position: "relative", background: C.card, border: `1px solid ${C.borde}`, borderRadius: 24, padding: "36px 26px", width: "100%", maxWidth: 380, minHeight: 500, maxHeight: "90svh", overflowY: "auto", display: "flex", flexDirection: "column" }}>
 
           {/* ---------- Paso 1: elegir persona ---------- */}
           {loginStep === "select" && (
@@ -694,7 +698,13 @@ export default function App() {
                     }} />
                   ))}
                 </div>
-                {pinError && <p style={{ color: C.rojo, fontSize: 12.5, textAlign: "center", maxWidth: 220, margin: 0 }} role="alert">{pinErrorMsg}</p>}
+                {/* minHeight fijo: el mensaje de error reserva su espacio SIEMPRE (visible u
+                    oculto), para que aparecer/desaparecer no empuje los puntos de PIN justo
+                    en el momento en que están temblando — esa combinación era la causa más
+                    probable del "traslape" que se veía. */}
+                <div style={{ minHeight: 32, display: "flex", alignItems: "flex-start" }}>
+                  {pinError && <p style={{ color: C.rojo, fontSize: 12.5, textAlign: "center", maxWidth: 220, margin: 0 }} role="alert">{pinErrorMsg}</p>}
+                </div>
               </div>
 
               <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12 }} role="group" aria-label="Teclado numérico">
@@ -715,12 +725,16 @@ export default function App() {
             </div>
           )}
 
-          {/* ---------- Paso 3: bienvenida (auto-avanza, o toca para no esperar) ---------- */}
+          {/* ---------- Paso 3: bienvenida — 3s para leerlo, o "Continuar" para saltarlo ---------- */}
           {loginStep === "success" && personaActual && (
-            <div onClick={terminarLogin} className="rp-pop" style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, cursor: "pointer" }}>
+            <div className="rp-pop" style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14 }}>
               <div className="rp-pulse" style={{ width: 88, height: 88, borderRadius: "50%", background: `radial-gradient(circle, ${personaActual.color}55, ${C.dorado}55)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 36 }} aria-hidden="true">💛</div>
               <h2 className="rp-display" style={{ color: C.texto, fontSize: 22, fontWeight: 800, margin: 0, textAlign: "center" }}>Bienvenido/a, {personaActual.name}</h2>
               <p style={{ color: C.sec, fontSize: 13, textAlign: "center", lineHeight: 1.6, margin: 0, maxWidth: 250 }}>Que este espacio siga creciendo con cada recuerdo que suman juntos.</p>
+              <button onClick={terminarLogin} className="rp-display"
+                style={{ marginTop: 10, padding: "12px 28px", borderRadius: 14, border: "none", background: `linear-gradient(135deg, ${C.verdeBtn}, ${C.azulBtn})`, color: "#fff", fontWeight: 700, fontSize: 14, cursor: "pointer", minHeight: 44 }}>
+                Continuar
+              </button>
             </div>
           )}
         </div>

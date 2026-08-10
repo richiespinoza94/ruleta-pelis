@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   Film, Check, X, MapPin, Popcorn, Sparkles, Clock,
   ChevronDown, ChevronLeft, RotateCw, Star, Calendar, Eye, Heart,
-  BellRing, BellOff, Wifi, BookOpen, Link2, User, Wand2
+  BellRing, BellOff, Wifi, BookOpen, Link2, User, Wand2, Pencil
 } from "lucide-react";
 import { db, VAPID_KEY, getMessagingSeguro, obtenerMetadatosEnlace } from "./firebase";
 import { doc, onSnapshot, setDoc, runTransaction, updateDoc, arrayUnion } from "firebase/firestore";
@@ -337,6 +337,7 @@ export default function App() {
   const [compartiendo, setCompartiendo] = useState(null); // lectura sobre la que se está compartiendo impresión
   const [showLecturasHistorial, setShowLecturasHistorial] = useState(false);
   const [lecturaDetalle, setLecturaDetalle] = useState(null);
+  const [editandoLectura, setEditandoLectura] = useState(null);
   const [saving, setSaving] = useState(false);          // #8 loading en escrituras
   const [toast, setToast] = useState(null);              // #2 micro-toast de estado
   const [pushEstado, setPushEstado] = useState("desconocido"); // push: desconocido | no-soportado | pendiente | activo | bloqueado | error
@@ -818,6 +819,20 @@ export default function App() {
     setShowAddLectura(false);
   };
 
+  /* ---- Editar título/autor/enlace/contexto de una lectura ya existente ----
+     No usa transacción a propósito: a diferencia de las impresiones (donde dos
+     personas escriben simultáneamente en campos DISTINTOS del mismo objeto),
+     editar estos datos es una acción de una persona a la vez sobre el mismo
+     conjunto de campos — el guardado simple (igual que agregarLectura) alcanza. */
+  const editarLectura = (id, datos) => {
+    guardar({
+      lecturas: sala.lecturas.map((l) =>
+        l.id === id ? { ...l, titulo: datos.titulo, autor: datos.autor, enlace: datos.enlace, contexto: datos.contexto } : l
+      ),
+    });
+    setEditandoLectura(null);
+  };
+
   /* ---- Guardar impresión/meta de una lectura (mismo patrón anti-condición-de-carrera
      que guardarParte para películas: lee el dato fresco con una transacción, no la
      "foto" que se tomó al abrir el formulario) ---- */
@@ -965,11 +980,23 @@ export default function App() {
                   const rOk = imp.ricardo?.trim(), cOk = imp.catalina?.trim();
                   return (
                     <div key={l.id} style={{ background: `${C.dorado}12`, border: `1px solid ${C.dorado}44`, borderRadius: 14, padding: "12px 14px" }}>
-                      <div className="rp-display" style={{ fontWeight: 700, fontSize: 15, color: C.texto, marginBottom: 2 }}>{l.titulo}</div>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, marginBottom: 2 }}>
+                        <div className="rp-display" style={{ fontWeight: 700, fontSize: 15, color: C.texto, flex: 1, minWidth: 0 }}>{l.titulo}</div>
+                        <button onClick={() => setEditandoLectura(l)} aria-label="Editar lectura" title="Editar"
+                          style={{ flexShrink: 0, width: 44, height: 44, borderRadius: 10, background: "transparent", border: `1px solid ${C.borde}`, color: C.sec, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                          <Pencil size={14} />
+                        </button>
+                      </div>
                       {(l.autor || l.contexto) && (
-                        <div style={{ color: C.sec, fontSize: 11.5, marginBottom: 8 }}>
+                        <div style={{ color: C.sec, fontSize: 11.5, marginBottom: l.enlace ? 4 : 8 }}>
                           {l.autor}{l.autor && l.contexto ? " · " : ""}{l.contexto}
                         </div>
+                      )}
+                      {l.enlace && (
+                        <a href={l.enlace} target="_blank" rel="noopener noreferrer"
+                          style={{ display: "inline-flex", alignItems: "center", gap: 5, color: C.azul, fontSize: 11, marginBottom: 8, textDecoration: "none" }}>
+                          <Link2 size={11} /> Ver enlace original
+                        </a>
                       )}
                       <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
                         {["ricardo", "catalina"].map((uk) => {
@@ -1003,6 +1030,13 @@ export default function App() {
         {showAddLectura && (
           <AddLecturaForm onCancel={() => setShowAddLectura(false)} onSave={agregarLectura} />
         )}
+        {editandoLectura && (
+          <AddLecturaForm
+            lecturaExistente={editandoLectura}
+            onCancel={() => setEditandoLectura(null)}
+            onSave={(datos) => editarLectura(editandoLectura.id, datos)}
+          />
+        )}
         {compartiendo && (
           <CompartirLecturaForm lectura={compartiendo} currentUser={currentUser} onCancel={() => setCompartiendo(null)} onSave={(data) => guardarParteLectura(compartiendo, data)} />
         )}
@@ -1010,7 +1044,11 @@ export default function App() {
           <LecturasHistorialPanel lecturas={lecturasCompartidas} onClose={() => setShowLecturasHistorial(false)} onSelect={setLecturaDetalle} />
         )}
         {lecturaDetalle && (
-          <LecturaDetalle item={lecturaDetalle} onClose={() => setLecturaDetalle(null)} />
+          <LecturaDetalle
+            item={lecturaDetalle}
+            onClose={() => setLecturaDetalle(null)}
+            onEdit={(l) => { setLecturaDetalle(null); setEditandoLectura(l); }}
+          />
         )}
       </div>
     );
@@ -1667,11 +1705,12 @@ function HistoryDetail({ item, onClose }) {
    dispara solo al pegar el link) para no sorprender con llamadas
    de red en segundo plano — el usuario decide cuándo usarla.
    ============================================================ */
-function AddLecturaForm({ onCancel, onSave }) {
-  const [titulo, setTitulo] = useState("");
-  const [autor, setAutor] = useState("");
-  const [enlace, setEnlace] = useState("");
-  const [contexto, setContexto] = useState("");
+function AddLecturaForm({ onCancel, onSave, lecturaExistente }) {
+  const editando = !!lecturaExistente;
+  const [titulo, setTitulo] = useState(lecturaExistente?.titulo || "");
+  const [autor, setAutor] = useState(lecturaExistente?.autor || "");
+  const [enlace, setEnlace] = useState(lecturaExistente?.enlace || "");
+  const [contexto, setContexto] = useState(lecturaExistente?.contexto || "");
   const [autocompletando, setAutocompletando] = useState(false);
   const [shake, setShake] = useState(false);
 
@@ -1704,10 +1743,10 @@ function AddLecturaForm({ onCancel, onSave }) {
     <div style={overlay}>
       <div className="rp-slideup rp-body rp-scroll" style={{ ...sheet, maxHeight: "88vh", overflowY: "auto" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-          <span style={{ fontSize: 11, color: C.dorado, fontWeight: 600, letterSpacing: 1, textTransform: "uppercase" }}>Nueva lectura</span>
+          <span style={{ fontSize: 11, color: C.dorado, fontWeight: 600, letterSpacing: 1, textTransform: "uppercase" }}>{editando ? "Editar lectura" : "Nueva lectura"}</span>
           <button onClick={onCancel} style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
         </div>
-        <h2 className="rp-display" style={{ margin: "0 0 18px", fontSize: 22, fontWeight: 800, color: C.texto }}>¿Qué van a leer?</h2>
+        <h2 className="rp-display" style={{ margin: "0 0 18px", fontSize: 22, fontWeight: 800, color: C.texto }}>{editando ? "Actualiza los datos" : "¿Qué van a leer?"}</h2>
 
         <Field icon={<Link2 size={15} />} label="Link (opcional)">
           <div style={{ display: "flex", gap: 8 }}>
@@ -1737,7 +1776,7 @@ function AddLecturaForm({ onCancel, onSave }) {
 
         <button onClick={intentarGuardar} className="rp-display"
           style={{ width: "100%", padding: "15px", borderRadius: 14, border: "none", background: puedeGuardar ? `linear-gradient(135deg, ${C.verdeBtn}, ${C.azulBtn})` : C.cardHi, color: puedeGuardar ? "#fff" : C.sec, fontWeight: 700, fontSize: 15, cursor: "pointer", marginTop: 6, opacity: puedeGuardar ? 1 : 0.75 }}>
-          Agregar a la lista
+          {editando ? "Guardar cambios" : "Agregar a la lista"}
         </button>
         {!puedeGuardar && <p style={{ margin: "8px 0 0", fontSize: 11.5, color: C.sec, textAlign: "center" }}>Escribe al menos el título</p>}
       </div>
@@ -1864,13 +1903,19 @@ function LecturasHistorialPanel({ lecturas, onClose, onSelect }) {
   );
 }
 
-function LecturaDetalle({ item, onClose }) {
+function LecturaDetalle({ item, onClose, onEdit }) {
   return (
     <Modal title={item.titulo} onClose={onClose}>
-      <div style={{ display: "flex", gap: 12, marginBottom: 14, flexWrap: "wrap", fontSize: 13, color: C.sec }}>
-        {item.autor && <span>✍️ {item.autor}</span>}
-        <span>📅 {item.fecha}</span>
-        {item.contexto && <span>📍 {item.contexto}</span>}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, marginBottom: 14 }}>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", fontSize: 13, color: C.sec }}>
+          {item.autor && <span>✍️ {item.autor}</span>}
+          <span>📅 {item.fecha}</span>
+          {item.contexto && <span>📍 {item.contexto}</span>}
+        </div>
+        <button onClick={() => onEdit(item)} aria-label="Editar lectura" title="Editar"
+          style={{ flexShrink: 0, width: 44, height: 44, borderRadius: 10, background: "transparent", border: `1px solid ${C.borde}`, color: C.sec, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <Pencil size={14} />
+        </button>
       </div>
       {item.enlace && (
         <a href={item.enlace} target="_blank" rel="noopener noreferrer" style={{ display: "inline-flex", alignItems: "center", gap: 6, color: C.azul, fontSize: 12.5, marginBottom: 16, textDecoration: "none" }}>

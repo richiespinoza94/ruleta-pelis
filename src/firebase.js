@@ -4,12 +4,12 @@ import { getMessaging, isSupported } from "firebase/messaging";
 import { getFunctions, httpsCallable } from "firebase/functions";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyA8gYVgbT6V6qFZUVGwkgooUUoKg-3cxvc",
+  apiKey: "AIzaSyA8gYVgbT6V6qFZUVGwKgooUUoKg-3cxvc",
   authDomain: "ruleta-pelis.firebaseapp.com",
   projectId: "ruleta-pelis",
   storageBucket: "ruleta-pelis.firebasestorage.app",
-  messagingSenderId: "10147267814186",
-  appId: "1:10147267814186:web:56affcdbc8f32eb4eaaa93",
+  messagingSenderId: "1014726781418",
+  appId: "1:1014726781418:web:56affcdbc8f32eb4eaaa93",
 };
 
 const app = initializeApp(firebaseConfig);

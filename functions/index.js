@@ -25,6 +25,31 @@ const NOMBRES = { ricardo: "Ricardo", catalina: "Catalina" };
 const elOtro = (usuario) => (usuario === "ricardo" ? "catalina" : "ricardo");
 
 /**
+ * Detecta si alguien acaba de escribir su parte (nota de película o impresión
+ * de lectura) mientras el item SIGUE pendiente — es decir, "le tocó a la otra
+ * persona". No dispara si el item ya se completó (ambos escribieron) ni si es
+ * un item nuevo sin nada que comparar contra un "antes".
+ */
+function detectarNotaParcial(antesArr, despuesArr, campoDraft) {
+  const avisos = [];
+  if (!antesArr || !despuesArr) return avisos;
+  for (const d of despuesArr) {
+    if (d.state !== "pendiente") continue;
+    const a = antesArr.find((x) => x.id === d.id);
+    if (!a) continue;
+    const antesVals = (a.draft && a.draft[campoDraft]) || {};
+    const despuesVals = (d.draft && d.draft[campoDraft]) || {};
+    for (const persona of ["ricardo", "catalina"]) {
+      const teniaAntes = !!(antesVals[persona] && antesVals[persona].trim());
+      const tieneAhora = !!(despuesVals[persona] && despuesVals[persona].trim());
+      if (!teniaAntes && tieneAhora) avisos.push({ quien: persona, id: d.id });
+    }
+  }
+  return avisos;
+}
+
+
+/**
  * Envía una notificación a todos los dispositivos registrados de un usuario.
  * Si algún token ya no es válido (app desinstalada, permiso revocado, etc.),
  * lo limpia de Firestore para no seguir intentando enviarle.
@@ -114,27 +139,52 @@ exports.notificarCambios = onDocumentWritten(
     }
 
     /* ---------- 2) Alguien cambió su estado de ánimo ---------- */
-    if (!antes || !antes.estados || !despues.estados) return;
+    if (antes && antes.estados && despues.estados) {
+      for (const usuario of ["ricardo", "catalina"]) {
+        const estadoAntes = antes.estados[usuario];
+        const estadoDespues = despues.estados[usuario];
+        const cambio =
+          estadoAntes && estadoDespues && estadoAntes.label !== estadoDespues.label;
 
-    for (const usuario of ["ricardo", "catalina"]) {
-      const estadoAntes = antes.estados[usuario];
-      const estadoDespues = despues.estados[usuario];
-      const cambio =
-        estadoAntes && estadoDespues && estadoAntes.label !== estadoDespues.label;
-
-      if (cambio) {
-        const destinatario = elOtro(usuario);
-        await enviarA(destinatario, {
-          titulo: `${estadoDespues.emoji} ${NOMBRES[usuario]} cambió su estado`,
-          cuerpo: `Ahora está ${estadoDespues.label}`,
-          // Mismo tag para TODOS los cambios de estado: si cambia de ánimo varias
-          // veces seguidas, la notificación nueva REEMPLAZA a la anterior en la
-          // pantalla en vez de apilarse. Al final solo queda una, con el estado real.
-          tag: "ruleta-estado",
-          // renotify falso: la reemplaza en silencio, sin volver a vibrar cada vez.
-          renotify: false,
-        });
+        if (cambio) {
+          const destinatario = elOtro(usuario);
+          await enviarA(destinatario, {
+            titulo: `${estadoDespues.emoji} ${NOMBRES[usuario]} cambió su estado`,
+            cuerpo: `Ahora está ${estadoDespues.label}`,
+            // Mismo tag para TODOS los cambios de estado: si cambia de ánimo varias
+            // veces seguidas, la notificación nueva REEMPLAZA a la anterior en la
+            // pantalla en vez de apilarse. Al final solo queda una, con el estado real.
+            tag: "ruleta-estado",
+            // renotify falso: la reemplaza en silencio, sin volver a vibrar cada vez.
+            renotify: false,
+          });
+        }
       }
+    }
+
+    /* ---------- 3) Tu pareja registró su nota de una película (falta la tuya) ----------
+       Mismo criterio que ya usa la app para notificar: avisar cuando SE NECESITA una
+       acción tuya para que algo avance — igual que "pedir girar", pero para completar
+       el registro dual de una película. */
+    for (const aviso of detectarNotaParcial(antes && antes.movies, despues.movies, "notas")) {
+      const pelicula = despues.movies.find((m) => m.id === aviso.id);
+      await enviarA(elOtro(aviso.quien), {
+        titulo: "📝 Registraron su parte",
+        cuerpo: `${NOMBRES[aviso.quien]} ya escribió sobre "${pelicula ? pelicula.title : "una película"}" — te toca a ti`,
+        tag: `ruleta-nota-pelicula-${aviso.id}`, // por película: no colapsa avisos de películas distintas
+        renotify: true,
+      });
+    }
+
+    /* ---------- 4) Tu pareja compartió su impresión de una lectura (falta la tuya) ---------- */
+    for (const aviso of detectarNotaParcial(antes && antes.lecturas, despues.lecturas, "impresiones")) {
+      const lectura = despues.lecturas.find((l) => l.id === aviso.id);
+      await enviarA(elOtro(aviso.quien), {
+        titulo: "📖 Compartieron su impresión",
+        cuerpo: `${NOMBRES[aviso.quien]} ya escribió sobre "${lectura ? lectura.titulo : "una lectura"}" — te toca a ti`,
+        tag: `ruleta-impresion-lectura-${aviso.id}`,
+        renotify: true,
+      });
     }
   }
 );

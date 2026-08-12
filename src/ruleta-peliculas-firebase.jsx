@@ -2,9 +2,9 @@ import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   Film, Check, X, MapPin, Popcorn, Sparkles, Clock,
   ChevronDown, ChevronLeft, RotateCw, Star, Calendar, Eye, Heart,
-  BellRing, BellOff, Wifi, BookOpen, Link2, User, Wand2, Pencil
+  BellRing, BellOff, Wifi, BookOpen, Link2, User, Wand2, Pencil, Camera
 } from "lucide-react";
-import { db, VAPID_KEY, getMessagingSeguro, obtenerMetadatosEnlace } from "./firebase";
+import { db, VAPID_KEY, getMessagingSeguro, obtenerMetadatosEnlace, subirFotoPerfil } from "./firebase";
 import { doc, onSnapshot, setDoc, runTransaction, updateDoc, arrayUnion } from "firebase/firestore";
 import { getToken, onMessage } from "firebase/messaging";
 
@@ -35,6 +35,23 @@ const USERS = {
 };
 
 const ANNIVERSARY_DATE = "29 de julio de 2026";
+
+/* Días hasta el próximo cumpleaños, y a qué edad llega si se conoce el año.
+   Soporta guardar solo "MM-DD" (sin año) para quien prefiera no compartir su edad. */
+function diasHastaCumple(fechaCumpleISO, hoy = new Date()) {
+  if (!fechaCumpleISO) return null;
+  const partes = fechaCumpleISO.split("-").map(Number);
+  const [anioNac, mes, dia] = partes.length === 3 ? partes : [null, partes[0], partes[1]];
+
+  const hoySinHora = new Date(hoy.getFullYear(), hoy.getMonth(), hoy.getDate());
+  let proximo = new Date(hoySinHora.getFullYear(), mes - 1, dia);
+  if (proximo < hoySinHora) {
+    proximo = new Date(hoySinHora.getFullYear() + 1, mes - 1, dia);
+  }
+  const dias = Math.round((proximo - hoySinHora) / 86400000);
+  const edadQueCumple = anioNac ? proximo.getFullYear() - anioNac : null;
+  return { dias, edadQueCumple, esHoy: dias === 0 };
+}
 
 /* Mensajes de error del PIN — cálidos pero genéricos (sirven para cualquiera
    de los dos, ya que cualquiera puede equivocarse escribiendo). */
@@ -385,6 +402,9 @@ export default function App() {
   const [showLecturasHistorial, setShowLecturasHistorial] = useState(false);
   const [lecturaDetalle, setLecturaDetalle] = useState(null);
   const [editandoLectura, setEditandoLectura] = useState(null);
+  // --- Perfil (foto + cumpleaños) ---
+  const [perfilAbierto, setPerfilAbierto] = useState(null); // "ricardo" | "catalina" | null
+  const [subiendoFoto, setSubiendoFoto] = useState(false);
   const [saving, setSaving] = useState(false);          // #8 loading en escrituras
   const [toast, setToast] = useState(null);              // #2 micro-toast de estado
   const [pushEstado, setPushEstado] = useState("desconocido"); // push: desconocido | no-soportado | pendiente | activo | bloqueado | error
@@ -408,6 +428,10 @@ export default function App() {
           data.lecturas = [];
           setDoc(SALA_DOC, { lecturas: [] }, { merge: true }).catch(() => {});
         }
+        if (!data.perfiles) {
+          data.perfiles = { ricardo: { foto: null, cumpleanos: null }, catalina: { foto: null, cumpleanos: null } };
+          setDoc(SALA_DOC, { perfiles: data.perfiles }, { merge: true }).catch(() => {});
+        }
         setSala(data);
       } else {
         const inicial = {
@@ -418,6 +442,7 @@ export default function App() {
             ricardo: ESTADOS.find((e) => e.label === "Feliz"),
             catalina: ESTADOS.find((e) => e.label === "Romántico/a"),
           },
+          perfiles: { ricardo: { foto: null, cumpleanos: null }, catalina: { foto: null, cumpleanos: null } },
           spinReq: null,
           tokens: { ricardo: [], catalina: [] }, // tokens de push por dispositivo
         };
@@ -714,7 +739,11 @@ export default function App() {
                     <button key={key} onClick={() => seleccionarPersona(key)}
                       aria-label={`Entrar como ${u.name}`}
                       style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, padding: "22px 8px", borderRadius: 18, background: C.cardHi, border: `1px solid ${C.borde}`, cursor: "pointer", minHeight: 140 }}>
-                      <div style={{ width: 60, height: 60, borderRadius: "50%", background: u.btn, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontFamily: "Outfit, sans-serif", fontWeight: 700, fontSize: 24, boxShadow: `0 10px 24px ${u.color}55` }}>{u.initial}</div>
+                      <div style={{ width: 60, height: 60, borderRadius: "50%", background: sala.perfiles?.[key]?.foto ? C.cardHi : u.btn, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", color: "#fff", fontFamily: "Outfit, sans-serif", fontWeight: 700, fontSize: 24, boxShadow: `0 10px 24px ${u.color}55` }}>
+                        {sala.perfiles?.[key]?.foto
+                          ? <img src={sala.perfiles[key].foto} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                          : u.initial}
+                      </div>
                       <span className="rp-display" style={{ color: C.texto, fontWeight: 600, fontSize: 15 }}>{u.name}</span>
                     </button>
                   );
@@ -880,6 +909,31 @@ export default function App() {
     setEditandoLectura(null);
   };
 
+  /* ---- Guardar foto y/o cumpleaños de perfil. La foto es opcional en cada
+     guardado (puede cambiarse solo el cumpleaños sin re-subir la foto). ---- */
+  const guardarPerfil = async (usuario, { archivoNuevo, cumpleanos }) => {
+    setSaving(true);
+    try {
+      let fotoURL = sala.perfiles?.[usuario]?.foto || null;
+      if (archivoNuevo) {
+        setSubiendoFoto(true);
+        try {
+          fotoURL = await subirFotoPerfil(usuario, archivoNuevo);
+        } finally {
+          setSubiendoFoto(false);
+        }
+      }
+      await guardar({
+        perfiles: {
+          ...sala.perfiles,
+          [usuario]: { foto: fotoURL, cumpleanos: cumpleanos || null },
+        },
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
   /* ---- Guardar impresión/meta de una lectura (mismo patrón anti-condición-de-carrera
      que guardarParte para películas: lee el dato fresco con una transacción, no la
      "foto" que se tomó al abrir el formulario) ---- */
@@ -928,16 +982,26 @@ export default function App() {
         <div style={{ position: "sticky", top: 0, zIndex: 10, background: `${C.fondo}ee`, backdropFilter: "blur(10px)", borderBottom: `1px solid ${C.borde}`, padding: "12px 16px" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", maxWidth: 460, margin: "0 auto" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <div style={{ width: 36, height: 36, borderRadius: "50%", background: me.color, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, color: "#fff" }} className="rp-display">{me.initial}</div>
+              <button onClick={() => setPerfilAbierto(currentUser)} aria-label="Ver tu perfil" style={{ position: "relative", padding: 0, border: "none", background: "none", cursor: "pointer", flexShrink: 0 }}>
+                <Avatar usuario={currentUser} foto={sala.perfiles?.[currentUser]?.foto} size={44} />
+                <div style={{ position: "absolute", bottom: -2, right: -2, width: 18, height: 18, borderRadius: "50%", background: me.color, border: `2px solid ${C.fondo}`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <Pencil size={9} color="#fff" />
+                </div>
+              </button>
               <div>
                 <div className="rp-display" style={{ fontSize: 15, fontWeight: 700, lineHeight: 1 }}>Hola, {me.name}</div>
                 <div style={{ fontSize: 11, color: C.sec }}>Elige qué hacer juntos</div>
               </div>
             </div>
-            <button onClick={() => { setScreen("login"); setCurrentUser(null); }} title="Salir" aria-label="Cerrar sesión"
-              style={{ width: 44, height: 44, borderRadius: 10, background: C.card, border: `1px solid ${C.borde}`, color: C.sec, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <X size={17} />
-            </button>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <button onClick={() => setPerfilAbierto(other)} aria-label={`Ver el perfil de ${USERS[other].name}`} style={{ padding: 0, border: "none", background: "none", cursor: "pointer" }}>
+                <Avatar usuario={other} foto={sala.perfiles?.[other]?.foto} size={44} />
+              </button>
+              <button onClick={() => { setScreen("login"); setCurrentUser(null); }} title="Salir" aria-label="Cerrar sesión"
+                style={{ width: 44, height: 44, borderRadius: 10, background: C.card, border: `1px solid ${C.borde}`, color: C.sec, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <X size={17} />
+              </button>
+            </div>
           </div>
         </div>
 
@@ -964,6 +1028,18 @@ export default function App() {
             </div>
           </button>
         </div>
+
+        {perfilAbierto && (
+          <PerfilModal
+            usuario={perfilAbierto}
+            esPropio={perfilAbierto === currentUser}
+            perfil={sala.perfiles?.[perfilAbierto]}
+            onClose={() => setPerfilAbierto(null)}
+            onGuardar={guardarPerfil}
+            saving={saving}
+            subiendoFoto={subiendoFoto}
+          />
+        )}
       </div>
     );
   }
@@ -1418,6 +1494,125 @@ function PushBanner({ estado, ocupado, onActivar, nombreOtro, errorMsg }) {
         <BellRing size={16} className={ocupado ? "rp-pulse" : ""} />
         {ocupado ? "Activando…" : "Activar notificaciones"}
       </button>
+    </div>
+  );
+}
+
+/* ============================================================
+   Avatar — componente reutilizable, usado en los lugares "grandes"
+   (Hub, login). Muestra la foto si existe; si no, el círculo de
+   color + inicial de siempre — nunca se rompe si nadie subió foto.
+   ============================================================ */
+function Avatar({ usuario, foto, size = 40 }) {
+  const u = USERS[usuario];
+  return (
+    <div style={{
+      width: size, height: size, borderRadius: "50%",
+      background: foto ? C.cardHi : u.btn,
+      border: `2px solid ${u.color}`,
+      display: "flex", alignItems: "center", justifyContent: "center",
+      overflow: "hidden", flexShrink: 0,
+    }}>
+      {foto
+        ? <img src={foto} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+        : <span className="rp-display" style={{ fontSize: size * 0.4, fontWeight: 700, color: "#fff" }}>{u.initial}</span>}
+    </div>
+  );
+}
+
+/* ============================================================
+   PerfilModal — ver foto grande + cuenta regresiva de cumpleaños.
+   Si es tu propio perfil, un botón de editar lleva a cambiar foto
+   y fecha (mismo patrón "ver primero, editar con el lápiz" que ya
+   se usa en las lecturas).
+   ============================================================ */
+function PerfilModal({ usuario, esPropio, perfil, onClose, onGuardar, saving, subiendoFoto }) {
+  const cerrar = useBackCloses(onClose);
+  const [modoEdicion, setModoEdicion] = useState(false);
+  const [cumpleInput, setCumpleInput] = useState(perfil?.cumpleanos || "");
+  const [archivoElegido, setArchivoElegido] = useState(null);
+  const [previewURL, setPreviewURL] = useState(null);
+  const fileInputRef = useRef(null);
+
+  const u = USERS[usuario];
+  const cuenta = diasHastaCumple(perfil?.cumpleanos);
+
+  const elegirArchivo = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setArchivoElegido(f);
+    setPreviewURL(URL.createObjectURL(f));
+  };
+
+  const guardar = () => {
+    onGuardar(usuario, { archivoNuevo: archivoElegido, cumpleanos: cumpleInput });
+    setModoEdicion(false);
+    setArchivoElegido(null);
+  };
+
+  return (
+    <div style={overlay} onClick={cerrar}>
+      <div className="rp-slideup rp-body rp-scroll" style={{ ...sheet, maxHeight: "85vh", overflowY: "auto", textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ position: "sticky", top: 0, zIndex: 2, background: C.card, display: "flex", justifyContent: "flex-end", marginBottom: 4 }}>
+          <button onClick={cerrar} aria-label="Cerrar" style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
+        </div>
+
+        <div style={{ width: 120, height: 120, borderRadius: "50%", margin: "0 auto 14px", border: `3px solid ${u.color}`, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", background: (previewURL || perfil?.foto) ? C.cardHi : u.btn }}>
+          {previewURL || perfil?.foto
+            ? <img src={previewURL || perfil.foto} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+            : <span className="rp-display" style={{ fontSize: 44, fontWeight: 700, color: "#fff" }}>{u.initial}</span>}
+        </div>
+
+        <h2 className="rp-display" style={{ margin: "0 0 4px", fontSize: 20, fontWeight: 800, color: C.texto }}>{u.name}</h2>
+
+        {!modoEdicion && cuenta && (
+          <div className="rp-pop" style={{ display: "inline-flex", flexDirection: "column", alignItems: "center", gap: 2, margin: "10px auto 4px", padding: "12px 20px", borderRadius: 16, background: `${C.dorado}14`, border: `1px solid ${C.dorado}44` }}>
+            <span style={{ fontSize: 24 }} aria-hidden="true">🎂</span>
+            <span className="rp-display" style={{ fontSize: 22, fontWeight: 800, color: C.dorado }}>
+              {cuenta.esHoy ? "¡Hoy!" : `${cuenta.dias} día${cuenta.dias === 1 ? "" : "s"}`}
+            </span>
+            <span style={{ fontSize: 11.5, color: C.sec }}>
+              {cuenta.esHoy ? "¡Feliz cumpleaños!" : "para su cumpleaños"}
+              {cuenta.edadQueCumple ? ` · cumple ${cuenta.edadQueCumple}` : ""}
+            </span>
+          </div>
+        )}
+        {!modoEdicion && !cuenta && esPropio && (
+          <p style={{ color: C.sec, fontSize: 12, margin: "8px 0 0" }}>Aún no agregaste tu fecha de cumpleaños</p>
+        )}
+
+        {esPropio && !modoEdicion && (
+          <button onClick={() => setModoEdicion(true)} className="rp-display"
+            style={{ marginTop: 16, padding: "10px 18px", borderRadius: 12, border: `1px solid ${C.borde}`, background: "transparent", color: C.texto, fontWeight: 600, fontSize: 13, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <Pencil size={13} /> Editar perfil
+          </button>
+        )}
+
+        {esPropio && modoEdicion && (
+          <div style={{ textAlign: "left", marginTop: 18 }}>
+            <input ref={fileInputRef} type="file" accept="image/*" onChange={elegirArchivo} style={{ display: "none" }} />
+            <button onClick={() => fileInputRef.current?.click()} disabled={subiendoFoto} className="rp-display"
+              style={{ width: "100%", padding: "12px", borderRadius: 12, border: `1px dashed ${C.borde}`, background: "transparent", color: C.texto, fontWeight: 600, fontSize: 13, cursor: "pointer", marginBottom: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <Camera size={15} className={subiendoFoto ? "rp-pulse" : ""} /> {subiendoFoto ? "Subiendo…" : "Cambiar foto"}
+            </button>
+
+            <Field icon={<Calendar size={15} />} label="Fecha de cumpleaños">
+              <input type="date" value={cumpleInput} onChange={(e) => setCumpleInput(e.target.value)} style={inputS} className="rp-body" />
+            </Field>
+
+            <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
+              <button onClick={() => { setModoEdicion(false); setArchivoElegido(null); setPreviewURL(null); }} className="rp-display"
+                style={{ flex: 1, padding: "12px", borderRadius: 12, border: `1px solid ${C.borde}`, background: "transparent", color: C.sec, fontWeight: 600, fontSize: 13, cursor: "pointer" }}>
+                Cancelar
+              </button>
+              <button onClick={guardar} disabled={saving || subiendoFoto} className="rp-display"
+                style={{ flex: 1.4, padding: "12px", borderRadius: 12, border: "none", background: `linear-gradient(135deg, ${C.verdeBtn}, ${C.azulBtn})`, color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer", opacity: (saving || subiendoFoto) ? 0.6 : 1 }}>
+                Guardar
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

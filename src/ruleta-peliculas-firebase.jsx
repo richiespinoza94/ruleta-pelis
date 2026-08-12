@@ -139,6 +139,53 @@ const vibrate = (pattern) => {
   }
 };
 
+/* ============================================================
+   useBackCloses — conecta el botón/gesto "atrás" del celular con
+   el cierre de un modal, en vez de que se le escape al navegador
+   y termine cerrando la app entera.
+   ------------------------------------------------------------
+   Cómo funciona: al MONTAR (el modal se abre), empuja una entrada
+   al historial del navegador y escucha el evento "popstate" (que
+   dispara tanto el botón físico de Android como el gesto de swipe).
+   Cuando ese evento llega, ejecuta el cierre real.
+
+   Se devuelve una función `cerrar` que TODO botón de cierre del
+   modal debe usar (la X, tocar fuera, "Cancelar") — nunca la
+   función de cierre original directamente. Así hay un solo camino
+   de cierre sin importar de dónde vino, y el historial del
+   navegador nunca queda con una entrada "colgada" que rompa el
+   próximo "atrás" en la pantalla de abajo. */
+/* Pila compartida de "qué modal cerrar si llega un atrás" — necesaria porque
+   "popstate" es un evento global del navegador: si cada modal escuchara por
+   su cuenta, un solo "atrás" con dos modales apilados (ej. detalle abierto
+   encima de una lista) cerraría los DOS de golpe en vez de uno a la vez.
+   Con la pila, siempre se cierra solo el de más arriba, como se espera. */
+const rpModalStack = [];
+if (typeof window !== "undefined" && !window.__rpBackHandlerInstalled) {
+  window.__rpBackHandlerInstalled = true;
+  window.addEventListener("popstate", () => {
+    const top = rpModalStack[rpModalStack.length - 1];
+    if (top) top();
+  });
+}
+
+function useBackCloses(onClose) {
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    window.history.pushState({ rpModal: true }, "");
+    const entry = () => onCloseRef.current();
+    rpModalStack.push(entry);
+    return () => {
+      const idx = rpModalStack.indexOf(entry);
+      if (idx !== -1) rpModalStack.splice(idx, 1);
+    };
+  }, []); // eslint-disable-line
+
+  return () => window.history.back();
+}
+
 const FontStyles = () => (
   <style>{`
     @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Poppins:wght@400;500;600&display=swap');
@@ -1202,23 +1249,12 @@ export default function App() {
       )}
 
       {sala.spinReq?.status === "pending" && sala.spinReq.by !== currentUser && (
-        <div style={overlay}>
-          <div className="rp-pop" style={{ ...sheet, textAlign: "center", borderTop: `4px solid ${C.rojo}` }}>
-            <div style={{ fontSize: 44, marginBottom: 6 }}>🎡</div>
-            <h2 className="rp-display" style={{ margin: "0 0 6px", fontSize: 21, fontWeight: 800 }}>¡{USERS[sala.spinReq.by].name} quiere girar!</h2>
-            <p style={{ color: C.sec, fontSize: 14, margin: "0 0 22px" }}>¿Aceptas girar la ruleta juntos?</p>
-            <div style={{ display: "flex", gap: 10 }}>
-              <button onClick={() => guardar({ spinReq: null })} disabled={saving} className="rp-display"
-                style={{ flex: 1, padding: "14px", borderRadius: 14, border: `1px solid ${C.borde}`, background: "transparent", color: C.sec, fontWeight: 600, fontSize: 15, cursor: saving ? "not-allowed" : "pointer", opacity: saving ? 0.6 : 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-                <X size={17} /> Ahora no
-              </button>
-              <button onClick={() => guardar({ spinReq: { ...sala.spinReq, status: "approved" } })} disabled={saving} className="rp-display"
-                style={{ flex: 1.4, padding: "14px", borderRadius: 14, border: "none", background: `linear-gradient(135deg, ${C.verdeBtn}, ${C.azulBtn})`, color: "#fff", fontWeight: 700, fontSize: 15, cursor: saving ? "not-allowed" : "pointer", opacity: saving ? 0.7 : 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-                <Check size={18} /> {saving ? "Confirmando…" : "¡Aceptar!"}
-              </button>
-            </div>
-          </div>
-        </div>
+        <SpinApprovalModal
+          nombreQuienPide={USERS[sala.spinReq.by].name}
+          saving={saving}
+          onDecline={() => guardar({ spinReq: null })}
+          onAccept={() => guardar({ spinReq: { ...sala.spinReq, status: "approved" } })}
+        />
       )}
 
       {winner && !registrando && (
@@ -1386,13 +1422,37 @@ function PushBanner({ estado, ocupado, onActivar, nombreOtro, errorMsg }) {
   );
 }
 
-function Modal({ title, children, onClose }) {
+function SpinApprovalModal({ nombreQuienPide, saving, onDecline, onAccept }) {
+  const cerrar = useBackCloses(onDecline); // "atrás" = lo mismo que "Ahora no", nunca aprueba por accidente
   return (
-    <div style={overlay} onClick={onClose}>
-      <div className="rp-slideup rp-body" style={sheet} onClick={(e) => e.stopPropagation()}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+    <div style={overlay} onClick={cerrar}>
+      <div className="rp-pop" style={{ ...sheet, textAlign: "center", borderTop: `4px solid ${C.rojo}` }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ fontSize: 44, marginBottom: 6 }}>🎡</div>
+        <h2 className="rp-display" style={{ margin: "0 0 6px", fontSize: 21, fontWeight: 800 }}>¡{nombreQuienPide} quiere girar!</h2>
+        <p style={{ color: C.sec, fontSize: 14, margin: "0 0 22px" }}>¿Aceptas girar la ruleta juntos?</p>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={cerrar} disabled={saving} className="rp-display"
+            style={{ flex: 1, padding: "14px", borderRadius: 14, border: `1px solid ${C.borde}`, background: "transparent", color: C.sec, fontWeight: 600, fontSize: 15, cursor: saving ? "not-allowed" : "pointer", opacity: saving ? 0.6 : 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+            <X size={17} /> Ahora no
+          </button>
+          <button onClick={onAccept} disabled={saving} className="rp-display"
+            style={{ flex: 1.4, padding: "14px", borderRadius: 14, border: "none", background: `linear-gradient(135deg, ${C.verdeBtn}, ${C.azulBtn})`, color: "#fff", fontWeight: 700, fontSize: 15, cursor: saving ? "not-allowed" : "pointer", opacity: saving ? 0.7 : 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+            <Check size={18} /> {saving ? "Confirmando…" : "¡Aceptar!"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Modal({ title, children, onClose }) {
+  const cerrar = useBackCloses(onClose);
+  return (
+    <div style={overlay} onClick={cerrar}>
+      <div className="rp-slideup rp-body rp-scroll" style={{ ...sheet, maxHeight: "85vh", overflowY: "auto" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ position: "sticky", top: 0, zIndex: 2, background: C.card, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, paddingBottom: 4 }}>
           <h2 className="rp-display" style={{ margin: 0, fontSize: 19, fontWeight: 700, color: C.texto }}>{title}</h2>
-          <button onClick={onClose} style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
+          <button onClick={cerrar} aria-label="Cerrar" style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
         </div>
         {children}
       </div>
@@ -1401,6 +1461,7 @@ function Modal({ title, children, onClose }) {
 }
 
 function ViewingForm({ movie, currentUser, onCancel, onSave }) {
+  const cerrar = useBackCloses(onCancel);
   const draft = movie.draft || {};
   const [fecha, setFecha] = useState(draft.fecha || new Date().toISOString().slice(0, 10));
   const [lugar, setLugar] = useState(draft.lugar || LUGARES[0]);
@@ -1428,9 +1489,9 @@ function ViewingForm({ movie, currentUser, onCancel, onSave }) {
   return (
     <div style={overlay}>
       <div className="rp-slideup rp-body rp-scroll" style={{ ...sheet, maxHeight: "88vh", overflowY: "auto" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+        <div style={{ position: "sticky", top: 0, zIndex: 2, background: C.card, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, paddingBottom: 4 }}>
           <span style={{ fontSize: 11, color: C.dorado, fontWeight: 600, letterSpacing: 1, textTransform: "uppercase" }}>Registrar noche de cine</span>
-          <button onClick={onCancel} style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
+          <button onClick={cerrar} aria-label="Cerrar" style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
         </div>
         <h2 className="rp-display" style={{ margin: "0 0 18px", fontSize: 22, fontWeight: 800, color: C.texto }}>{movie.title}</h2>
 
@@ -1597,12 +1658,13 @@ function HistorialList({ items, getTitulo, searchFields, renderItem, placeholder
 }
 
 function HistoryPanel({ history, pendientes, onClose, onSelect, onRegistrar }) {
+  const cerrar = useBackCloses(onClose);
   return (
-    <div style={overlay} onClick={onClose}>
+    <div style={overlay} onClick={cerrar}>
       <div className="rp-slideup rp-body rp-scroll" style={{ ...sheet, maxHeight: "85vh", overflowY: "auto" }} onClick={(e) => e.stopPropagation()}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+        <div style={{ position: "sticky", top: 0, zIndex: 2, background: C.card, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, paddingBottom: 4 }}>
           <h2 className="rp-display" style={{ margin: 0, fontSize: 20, fontWeight: 800, color: C.texto }}>🎬 Tus películas</h2>
-          <button onClick={onClose} style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
+          <button onClick={cerrar} aria-label="Cerrar" style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
         </div>
 
         {pendientes.length > 0 && (
@@ -1681,15 +1743,18 @@ function HistoryDetail({ item, onClose }) {
         <span>{[1,2,3,4,5].map(n => <Star key={n} size={12} color={C.dorado} fill={n <= item.rating ? C.dorado : "none"} style={{ verticalAlign: "middle" }} />)}</span>
       </div>
       <div style={{ background: C.cardHi, borderRadius: 12, padding: "12px 14px", fontSize: 13, lineHeight: 1.5, color: C.texto, marginBottom: 16 }}>{item.movie.synopsis}</div>
-      {["ricardo", "catalina"].map((uk) => {
+      {["ricardo", "catalina"].map((uk, idx) => {
         const u = USERS[uk], txt = item.notas?.[uk];
         return (
-          <div key={uk} style={{ marginBottom: 12 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
-              <div style={{ width: 20, height: 20, borderRadius: "50%", background: u.color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff" }} className="rp-display">{u.initial}</div>
+          <div key={uk} style={{
+            marginBottom: 14, paddingTop: idx === 0 ? 0 : 14,
+            borderTop: idx === 0 ? "none" : `1px solid ${C.borde}`,
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+              <div style={{ width: 20, height: 20, borderRadius: "50%", background: u.color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff", flexShrink: 0 }} className="rp-display">{u.initial}</div>
               <span className="rp-display" style={{ fontSize: 13, fontWeight: 600, color: u.color }}>{u.name} dijo:</span>
             </div>
-            <p style={{ margin: 0, fontSize: 13.5, color: txt ? C.texto : C.sec, fontStyle: txt ? "normal" : "italic", paddingLeft: 26 }}>{txt || "— sin comentarios —"}</p>
+            <p style={{ margin: 0, fontSize: 13.5, lineHeight: 1.6, textAlign: "left", color: txt ? C.texto : C.sec, fontStyle: txt ? "normal" : "italic", paddingLeft: 26 }}>{txt || "— sin comentarios —"}</p>
           </div>
         );
       })}
@@ -1706,6 +1771,7 @@ function HistoryDetail({ item, onClose }) {
    de red en segundo plano — el usuario decide cuándo usarla.
    ============================================================ */
 function AddLecturaForm({ onCancel, onSave, lecturaExistente }) {
+  const cerrar = useBackCloses(onCancel);
   const editando = !!lecturaExistente;
   const [titulo, setTitulo] = useState(lecturaExistente?.titulo || "");
   const [autor, setAutor] = useState(lecturaExistente?.autor || "");
@@ -1742,9 +1808,9 @@ function AddLecturaForm({ onCancel, onSave, lecturaExistente }) {
   return (
     <div style={overlay}>
       <div className="rp-slideup rp-body rp-scroll" style={{ ...sheet, maxHeight: "88vh", overflowY: "auto" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+        <div style={{ position: "sticky", top: 0, zIndex: 2, background: C.card, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, paddingBottom: 4 }}>
           <span style={{ fontSize: 11, color: C.dorado, fontWeight: 600, letterSpacing: 1, textTransform: "uppercase" }}>{editando ? "Editar lectura" : "Nueva lectura"}</span>
-          <button onClick={onCancel} style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
+          <button onClick={cerrar} aria-label="Cerrar" style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
         </div>
         <h2 className="rp-display" style={{ margin: "0 0 18px", fontSize: 22, fontWeight: 800, color: C.texto }}>{editando ? "Actualiza los datos" : "¿Qué van a leer?"}</h2>
 
@@ -1788,6 +1854,7 @@ function AddLecturaForm({ onCancel, onSave, lecturaExistente }) {
    CompartirLecturaForm — impresión + meta dual (mismo patrón que ViewingForm)
    ============================================================ */
 function CompartirLecturaForm({ lectura, currentUser, onCancel, onSave }) {
+  const cerrar = useBackCloses(onCancel);
   const draft = lectura.draft || {};
   const [fecha, setFecha] = useState(draft.fecha || new Date().toISOString().slice(0, 10));
   const [impresion, setImpresion] = useState(draft.impresiones?.[currentUser] || "");
@@ -1813,9 +1880,9 @@ function CompartirLecturaForm({ lectura, currentUser, onCancel, onSave }) {
   return (
     <div style={overlay}>
       <div className="rp-slideup rp-body rp-scroll" style={{ ...sheet, maxHeight: "88vh", overflowY: "auto" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+        <div style={{ position: "sticky", top: 0, zIndex: 2, background: C.card, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, paddingBottom: 4 }}>
           <span style={{ fontSize: 11, color: C.dorado, fontWeight: 600, letterSpacing: 1, textTransform: "uppercase" }}>Compartir impresión</span>
-          <button onClick={onCancel} style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
+          <button onClick={cerrar} aria-label="Cerrar" style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
         </div>
         <h2 className="rp-display" style={{ margin: "0 0 4px", fontSize: 20, fontWeight: 800, color: C.texto }}>{lectura.titulo}</h2>
         {(lectura.autor || lectura.contexto) && (
@@ -1873,12 +1940,13 @@ function CompartirLecturaForm({ lectura, currentUser, onCancel, onSave }) {
    LecturasHistorialPanel — usa el mismo HistorialList que películas
    ============================================================ */
 function LecturasHistorialPanel({ lecturas, onClose, onSelect }) {
+  const cerrar = useBackCloses(onClose);
   return (
-    <div style={overlay} onClick={onClose}>
+    <div style={overlay} onClick={cerrar}>
       <div className="rp-slideup rp-body rp-scroll" style={{ ...sheet, maxHeight: "85vh", overflowY: "auto" }} onClick={(e) => e.stopPropagation()}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+        <div style={{ position: "sticky", top: 0, zIndex: 2, background: C.card, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, paddingBottom: 4 }}>
           <h2 className="rp-display" style={{ margin: 0, fontSize: 20, fontWeight: 800, color: C.texto }}>📖 Ya compartidas</h2>
-          <button onClick={onClose} style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
+          <button onClick={cerrar} aria-label="Cerrar" style={{ background: "none", border: "none", color: C.sec, cursor: "pointer" }}><X size={20} /></button>
         </div>
         <HistorialList
           items={lecturas}
@@ -1889,7 +1957,10 @@ function LecturasHistorialPanel({ lecturas, onClose, onSelect }) {
           renderItem={(l) => (
             <button key={l.id} onClick={() => onSelect(l)}
               style={{ textAlign: "left", background: C.cardHi, border: `1px solid ${C.borde}`, borderRadius: 14, padding: "12px 14px", cursor: "pointer", color: C.texto }}>
-              <div className="rp-display" style={{ fontWeight: 700, fontSize: 15 }}>{l.titulo}</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <div className="rp-display" style={{ fontWeight: 700, fontSize: 15, flex: 1, minWidth: 0 }}>{l.titulo}</div>
+                {l.enlace && <Link2 size={12} color={C.azul} aria-hidden="true" style={{ flexShrink: 0 }} />}
+              </div>
               <div style={{ fontSize: 12, color: C.sec, marginTop: 4, display: "flex", gap: 12, flexWrap: "wrap" }}>
                 {l.autor && <span>✍️ {l.autor}</span>}
                 <span>📅 {l.fecha}</span>
@@ -1917,24 +1988,39 @@ function LecturaDetalle({ item, onClose, onEdit }) {
           <Pencil size={14} />
         </button>
       </div>
-      {item.enlace && (
-        <a href={item.enlace} target="_blank" rel="noopener noreferrer" style={{ display: "inline-flex", alignItems: "center", gap: 6, color: C.azul, fontSize: 12.5, marginBottom: 16, textDecoration: "none" }}>
+
+      {item.enlace ? (
+        <a href={item.enlace} target="_blank" rel="noopener noreferrer" style={{ display: "inline-flex", alignItems: "center", gap: 6, color: C.azul, fontSize: 12.5, marginBottom: 18, textDecoration: "none" }}>
           <Link2 size={13} /> Ver el enlace original
         </a>
+      ) : (
+        // Invitación visible en vez de silencio: si aún no hay link (ej. se agregó
+        // solo con título), aquí mismo se puede añadir sin buscar el lápiz de editar.
+        <button onClick={() => onEdit(item)} className="rp-display"
+          style={{ display: "inline-flex", alignItems: "center", gap: 6, marginBottom: 18, padding: "6px 12px", borderRadius: 10, border: `1px dashed ${C.borde}`, background: "transparent", color: C.sec, fontSize: 12, cursor: "pointer" }}>
+          <Link2 size={13} /> Agregar enlace de esta lectura
+        </button>
       )}
-      {["ricardo", "catalina"].map((uk) => {
+
+      {["ricardo", "catalina"].map((uk, idx) => {
         const u = USERS[uk], txt = item.impresiones?.[uk], metaTxt = item.metas?.[uk];
         return (
-          <div key={uk} style={{ marginBottom: 14 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
-              <div style={{ width: 20, height: 20, borderRadius: "50%", background: u.color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff" }} className="rp-display">{u.initial}</div>
+          <div key={uk} style={{
+            marginBottom: 16, paddingTop: idx === 0 ? 0 : 16,
+            borderTop: idx === 0 ? "none" : `1px solid ${C.borde}`,
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+              <div style={{ width: 20, height: 20, borderRadius: "50%", background: u.color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff", flexShrink: 0 }} className="rp-display">{u.initial}</div>
               <span className="rp-display" style={{ fontSize: 13, fontWeight: 600, color: u.color }}>{u.name} sintió:</span>
             </div>
-            <p style={{ margin: "0 0 6px", fontSize: 13.5, color: txt ? C.texto : C.sec, fontStyle: txt ? "normal" : "italic", paddingLeft: 26 }}>{txt || "— sin comentarios —"}</p>
+            <p style={{ margin: "0 0 10px", fontSize: 13.5, lineHeight: 1.6, textAlign: "left", color: txt ? C.texto : C.sec, fontStyle: txt ? "normal" : "italic", paddingLeft: 26 }}>{txt || "— sin comentarios —"}</p>
             {metaTxt && (
-              <p style={{ margin: 0, fontSize: 12.5, color: C.sec, paddingLeft: 26, display: "flex", alignItems: "flex-start", gap: 5 }}>
-                <Heart size={12} style={{ marginTop: 2, flexShrink: 0 }} /> {metaTxt}
-              </p>
+              <div style={{ marginLeft: 26, background: `${C.dorado}12`, border: `1px solid ${C.dorado}33`, borderRadius: 10, padding: "8px 10px", display: "flex", alignItems: "flex-start", gap: 6 }}>
+                <Heart size={12} color={C.dorado} style={{ marginTop: 2, flexShrink: 0 }} />
+                <p style={{ margin: 0, fontSize: 12, lineHeight: 1.5, textAlign: "left", color: C.texto }}>
+                  <span style={{ color: C.dorado, fontWeight: 600 }}>Meta: </span>{metaTxt}
+                </p>
+              </div>
             )}
           </div>
         );
